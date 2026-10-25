@@ -117,20 +117,26 @@ jobs:
           repo init -u https://android.googlesource.com/kernel/manifest -b "$MANIFEST_BRANCH" --depth=1
 
           DEFAULT_MANIFEST_PATH=".repo/manifests/default.xml"
-          if [ -n "${{ inputs.kernel_tag }}" ] && [ -f "$DEFAULT_MANIFEST_PATH" ]; then
-            echo "[*] Pinning common project in manifest to: refs/tags/${{ inputs.kernel_tag }}"
-            sed -i "s|revision=\"${{ inputs.android_version }}-${{ inputs.kernel_version }}\"|revision=\"refs/tags/${{ inputs.kernel_tag }}\"|g" "$DEFAULT_MANIFEST_PATH" || true
+          if [ -f "$DEFAULT_MANIFEST_PATH" ]; then
+            # Strip virtual-device and tests to avoid unnecessary emulator modules and tag mismatch failures
+            echo "[*] Stripping unneeded virtual-device and test modules from manifest..."
+            sed -i '/common-modules\/virtual-device/d' "$DEFAULT_MANIFEST_PATH"
+            sed -i '/kernel\/tests/d' "$DEFAULT_MANIFEST_PATH"
+
+            if [ -n "${{ inputs.kernel_tag }}" ]; then
+              echo "[*] Pinning common project in manifest to: refs/tags/${{ inputs.kernel_tag }}"
+              sed -i "/path=\"common\"/ s|revision=\"[^\"]*\"|revision=\"refs/tags/${{ inputs.kernel_tag }}\"|" "$DEFAULT_MANIFEST_PATH"
+            fi
           fi
 
           echo "[*] Syncing kernel sources..."
-          repo sync -c -j$(nproc) --no-tags --no-clone-bundle
+          repo sync -c -j$(nproc) --force-sync --no-tags --no-clone-bundle
 
           cd common
           if [ -n "${{ inputs.kernel_tag }}" ]; then
             echo "[*] Verifying checkout matches tag: ${{ inputs.kernel_tag }}..."
             git checkout -f "refs/tags/${{ inputs.kernel_tag }}" 2>/dev/null || \
             git checkout -f "${{ inputs.kernel_tag }}" 2>/dev/null || \
-            (git fetch --depth=1 https://android.googlesource.com/kernel/common "refs/tags/${{ inputs.kernel_tag }}:refs/tags/${{ inputs.kernel_tag }}" && git checkout -f "refs/tags/${{ inputs.kernel_tag }}") || \
             echo "[!] Maintaining current branch tip commit"
           fi
           echo "[+] Verified kernel commit: $(git log -1 --oneline)"
