@@ -1,0 +1,21 @@
+# Build outputs
+artifacts/
+out/
+kernel/
+susfs_src/
+*.img
+*.zip
+*.tar.gz
+*.iso
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary and editor files
+.vscode/
+.idea/
+*.swp
+*.bak
+*~

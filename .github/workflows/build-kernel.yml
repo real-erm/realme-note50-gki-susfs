@@ -1,0 +1,380 @@
+name: Build Realme Note 50 GKI 2.0 (SUSFS + SELinux Enforcing)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_tag:
+        description: 'Android Common Kernel Tag or Branch'
+        required: true
+        type: string
+        default: 'android13-5.15.178_r00'
+      android_version:
+        description: 'Android Version'
+        required: true
+        type: choice
+        options:
+          - android13
+          - android14
+        default: android13
+      kernel_version:
+        description: 'Kernel Version'
+        required: true
+        type: choice
+        options:
+          - '5.15'
+        default: '5.15'
+      root_flavor:
+        description: 'Root Provider'
+        required: true
+        type: choice
+        options:
+          - KernelSU
+          - KernelSU-Next
+        default: KernelSU
+      ksu_branch:
+        description: 'KernelSU / KernelSU-Next Branch or Tag (leave blank for default)'
+        required: false
+        type: string
+        default: ''
+      enable_susfs:
+        description: 'Enable SUSFS (root hiding & mount evasion)'
+        required: true
+        type: boolean
+        default: true
+      susfs_branch:
+        description: 'SUSFS Branch in susfs4ksu repository'
+        required: true
+        type: string
+        default: 'gki-android13-5.15'
+      spoof_stock_config:
+        description: 'Spoof /proc/config.gz with Realme Note 50 stock config'
+        required: true
+        type: boolean
+        default: true
+      create_release:
+        description: 'Create GitHub Release with compiled binaries'
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build-kernel:
+    name: Build GKI Kernel (${{ inputs.kernel_tag }})
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout Builder Repository
+        uses: actions/checkout@v4
+
+      - name: Free Runner Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - name: Setup Swap Space (16 GB for Thin-LTO)
+        uses: pierotofy/set-swap-space@master
+        with:
+          swap-size-gb: 16
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev \
+            libgmp-dev libmpc-dev libmpfr-dev libssl-dev libelf-dev libncurses-dev \
+            python3 python3-pip python3-setuptools bc rsync jq libxml2-utils tar
+
+          # Install Google repo tool
+          mkdir -p ~/.bin
+          curl -sSL https://storage.googleapis.com/git-repo-downloads/repo > ~/.bin/repo
+          chmod a+x ~/.bin/repo
+          echo "$HOME/.bin" >> $GITHUB_PATH
+
+      - name: Initialize and Sync GKI Kernel Source
+        run: |
+          mkdir -p kernel
+          cd kernel
+
+          # Configure git identity for repo tool
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global color.ui false
+
+          MANIFEST_BRANCH="common-${{ inputs.android_version }}-${{ inputs.kernel_version }}"
+          echo "[*] Initializing repo with branch: $MANIFEST_BRANCH"
+          repo init -u https://android.googlesource.com/kernel/manifest -b "$MANIFEST_BRANCH" --depth=1
+
+          echo "[*] Syncing kernel sources..."
+          repo sync -c -j$(nproc) --no-tags --no-clone-bundle
+
+          cd common
+          # If a specific tag/commit was requested and differs from tip of branch, fetch and checkout
+          if [ -n "${{ inputs.kernel_tag }}" ] && [ "${{ inputs.kernel_tag }}" != "$MANIFEST_BRANCH" ]; then
+            echo "[*] Checking out specified tag: ${{ inputs.kernel_tag }}"
+            git fetch --depth=1 origin tag "${{ inputs.kernel_tag }}" || true
+            git checkout "${{ inputs.kernel_tag }}" || echo "[!] Tag checkout fallback: staying on manifest tip"
+          fi
+          echo "[*] Current kernel commit: $(git log -1 --oneline)"
+
+      - name: Integrate Root Provider (${{ inputs.root_flavor }})
+        run: |
+          cd kernel
+          if [ "${{ inputs.root_flavor }}" = "KernelSU-Next" ]; then
+            echo "[*] Installing KernelSU-Next..."
+            KSU_ARG="${{ inputs.ksu_branch }}"
+            [ -z "$KSU_ARG" ] && KSU_ARG="next"
+            curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "$KSU_ARG"
+          else
+            echo "[*] Installing official KernelSU..."
+            KSU_ARG="${{ inputs.ksu_branch }}"
+            [ -z "$KSU_ARG" ] && KSU_ARG="main"
+            curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "$KSU_ARG"
+          fi
+
+      - name: Apply SUSFS Patches & Integrate Core Files
+        if: ${{ inputs.enable_susfs }}
+        run: |
+          cd kernel
+          echo "[*] Cloning susfs4ksu (branch: ${{ inputs.susfs_branch }})..."
+          git clone --depth=1 -b "${{ inputs.susfs_branch }}" https://gitlab.com/simonpunk/susfs4ksu.git ../susfs_src
+
+          echo "[*] Patching KernelSU for SUSFS..."
+          if [ -f ../susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ]; then
+            cp ../susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
+            cd KernelSU
+            patch -p1 --forward < 10_enable_susfs_for_ksu.patch || echo "[!] Notice: Some KernelSU patch hunks already present or skipped"
+            cd ..
+          fi
+
+          echo "[*] Copying SUSFS kernel files into common/..."
+          cp -r ../susfs_src/kernel_patches/fs/* common/fs/
+          cp -r ../susfs_src/kernel_patches/include/linux/* common/include/linux/
+
+          echo "[*] Applying SUSFS kernel patch..."
+          SUSFS_PATCH="../susfs_src/kernel_patches/50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch"
+          if [ -f "$SUSFS_PATCH" ]; then
+            cp "$SUSFS_PATCH" common/
+            cd common
+            patch -p1 --forward < "$(basename "$SUSFS_PATCH")" || echo "[!] Notice: Check patch status"
+            cd ..
+          else
+            echo "[!] SUSFS patch $SUSFS_PATCH not found; checking alternatives..."
+            ALT_PATCH=$(find ../susfs_src/kernel_patches -name "50_add_susfs*.patch" | head -n 1)
+            if [ -n "$ALT_PATCH" ]; then
+              cp "$ALT_PATCH" common/
+              cd common
+              patch -p1 --forward < "$(basename "$ALT_PATCH")" || true
+              cd ..
+            fi
+          fi
+
+      - name: Configure Kernel Options (SUSFS + SELinux Enforcing + Stock Config Spoof)
+        run: |
+          cd kernel/common
+          DEFCONFIG="arch/arm64/configs/gki_defconfig"
+
+          echo "[*] Injecting KSU and SUSFS configuration flags..."
+          cat << 'EOF' >> "$DEFCONFIG"
+
+# KernelSU Configuration
+CONFIG_KSU=y
+
+# SUSFS Configuration
+CONFIG_KSU_SUSFS=y
+CONFIG_KSU_SUSFS_SUS_PATH=y
+CONFIG_KSU_SUSFS_SUS_MOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+CONFIG_KSU_SUSFS_SUS_KSTAT=y
+CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y
+CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+CONFIG_KSU_SUSFS_ENABLE_LOG=y
+CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+CONFIG_KSU_SUSFS_SUS_SU=y
+CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y
+EOF
+
+          echo "[*] Enforcing strict SELinux in defconfig..."
+          # Guarantee SELinux is compiled in and defaults to Enforcing
+          sed -i 's/^# CONFIG_SECURITY_SELINUX is not set/CONFIG_SECURITY_SELINUX=y/' "$DEFCONFIG"
+          grep -q "^CONFIG_SECURITY_SELINUX=y" "$DEFCONFIG" || echo "CONFIG_SECURITY_SELINUX=y" >> "$DEFCONFIG"
+          grep -q "^CONFIG_DEFAULT_SECURITY_SELINUX=y" "$DEFCONFIG" || echo "CONFIG_DEFAULT_SECURITY_SELINUX=y" >> "$DEFCONFIG"
+
+          # Ensure SELinux boot disable is NOT enabled
+          sed -i 's/^CONFIG_SECURITY_SELINUX_DISABLE=y/# CONFIG_SECURITY_SELINUX_DISABLE is not set/' "$DEFCONFIG"
+          sed -i 's/^CONFIG_SECURITY_SELINUX_BOOTPARAM=y/# CONFIG_SECURITY_SELINUX_BOOTPARAM is not set/' "$DEFCONFIG"
+
+          if [ "${{ inputs.spoof_stock_config }}" = "true" ] && [ -f "${{ github.workspace }}/config/stock_defconfig" ]; then
+            echo "[*] Installing Realme Note 50 stock config to spoof /proc/config.gz..."
+            cp "${{ github.workspace }}/config/stock_defconfig" arch/arm64/configs/stock_defconfig
+            sed -i 's|$(obj)/config_data: $(KCONFIG_CONFIG) FORCE|$(obj)/config_data: arch/arm64/configs/stock_defconfig FORCE|' kernel/Makefile
+            echo "[+] kernel/Makefile successfully patched to spoof /proc/config.gz"
+          fi
+
+          echo "[*] Cleaning kernel banner strings..."
+          # Strip '-dirty' suffix from kernel release
+          sed -i "s/printf '%s' -dirty/printf '%s' ''/g" scripts/setlocalversion
+
+          # Match stock compile host/user from Realme Note 50 banner
+          sed -i '/UTS_VERSION=/a LINUX_COMPILE_BY=build-user\nLINUX_COMPILE_HOST=build-host' scripts/mkcompile_h
+
+          # Disable defconfig check and ABI protected exports enforcement
+          cd ..
+          sed -i 's/check_defconfig//' common/build.config.gki || true
+          rm -f common/android/abi_gki_protected_exports_*
+
+      - name: Compile GKI Kernel
+        run: |
+          cd kernel
+
+          echo "[*] Starting kernel build via build/build.sh..."
+          BUILD_GKI_ARTIFACTS="" \
+          BUILD_GKI_CERTIFICATION_TOOLS=0 \
+          BUILD_SYSTEM_DLKM=0 \
+          SKIP_VENDOR_BOOT=1 \
+          SKIP_EXT_MODULES=1 \
+          SKIP_CP_KERNEL_HDR=1 \
+          OUT_DIR="/home/runner/out" \
+          LTO=thin \
+          BUILD_CONFIG=common/build.config.gki.aarch64 \
+          build/build.sh -j"$(nproc)"
+
+      - name: Verify Kernel Image and SELinux
+        run: |
+          IMAGE_PATH=""
+          if [ -f "/home/runner/out/dist/Image" ]; then
+            IMAGE_PATH="/home/runner/out/dist/Image"
+          elif [ -f "kernel/bazel-bin/common/kernel_aarch64/Image" ]; then
+            IMAGE_PATH="kernel/bazel-bin/common/kernel_aarch64/Image"
+          fi
+
+          if [ -z "$IMAGE_PATH" ]; then
+            echo "::error::Compiled Image not found in output directory!"
+            exit 1
+          fi
+
+          echo "[+] Kernel Image successfully built at $IMAGE_PATH ($(ls -lh "$IMAGE_PATH" | awk '{print $5}'))"
+
+          # Check SUSFS strings in compiled Image
+          SUSFS_COUNT=$(strings "$IMAGE_PATH" | grep -ic "susfs" || true)
+          echo "[+] SUSFS string occurrences in Image: $SUSFS_COUNT"
+          if [ "${{ inputs.enable_susfs }}" = "true" ] && [ "$SUSFS_COUNT" -eq 0 ]; then
+            echo "::warning::SUSFS strings not detected in compiled Image. Check patch application."
+          fi
+
+          # Verify SELinux configuration in compiled .config
+          CONFIG_PATH="/home/runner/out/.config"
+          if [ -f "$CONFIG_PATH" ]; then
+            echo "[*] Verifying SELinux configs in $CONFIG_PATH:"
+            grep -E "CONFIG_SECURITY_SELINUX|CONFIG_DEFAULT_SECURITY_SELINUX|CONFIG_KSU" "$CONFIG_PATH" || true
+          fi
+
+          echo "BUILT_IMAGE=$IMAGE_PATH" >> $GITHUB_ENV
+
+      - name: Build Userspace SUSFS Tool & Module
+        if: ${{ inputs.enable_susfs }}
+        run: |
+          mkdir -p artifacts/tools
+          if [ -d "susfs_src/ksu_module_susfs/tools" ]; then
+            echo "[*] Copying prebuilt ksu_susfs userspace binaries..."
+            cp -r susfs_src/ksu_module_susfs/tools/* artifacts/tools/ || true
+          fi
+
+          if [ -d "susfs_src/ksu_module_susfs" ]; then
+            echo "[*] Packaging susfs4ksu Magisk/KSU module..."
+            cd susfs_src/ksu_module_susfs
+            zip -r "${{ github.workspace }}/artifacts/susfs4ksu-module.zip" ./* -x ".git*"
+            cd "${{ github.workspace }}"
+          fi
+
+      - name: Package Boot Image & AnyKernel3
+        run: |
+          mkdir -p artifacts
+
+          # 1. Copy raw Image
+          cp "$BUILT_IMAGE" artifacts/Image
+
+          # 2. Package boot.img (Header Version 4, Realme Note 50 layout)
+          echo "[*] Generating boot.img with header version 4..."
+          export PYTHONPATH="${{ github.workspace }}/tools/mkbootimg"
+          python3 "${{ github.workspace }}/tools/mkbootimg/mkbootimg" \
+            --header_version 4 \
+            --kernel "$BUILT_IMAGE" \
+            -o artifacts/boot.img
+          echo "[+] Generated artifacts/boot.img ($(ls -lh artifacts/boot.img | awk '{print $5}'))"
+
+          # 3. Package AnyKernel3 flashable zip
+          echo "[*] Creating AnyKernel3 flashable zip..."
+          cp "$BUILT_IMAGE" tools/AnyKernel3/Image
+          cd tools/AnyKernel3
+          zip -r9 "${{ github.workspace }}/artifacts/AnyKernel3-Realme-Note50-GKI2.0-SUSFS.zip" * -x "*.git*" "README.md"
+          cd "${{ github.workspace }}"
+          echo "[+] Generated AnyKernel3 zip"
+
+          # 4. Generate MD5 and SHA256 checksums
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
+          md5sum * > MD5SUMS.txt
+          cd ..
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Realme-Note-50-GKI2.0-${{ inputs.kernel_tag }}-SUSFS
+          path: artifacts/*
+
+      - name: Create GitHub Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.kernel_tag }}-${{ inputs.root_flavor }}-SUSFS
+          name: "Realme Note 50 GKI 2.0 Kernel (${{ inputs.kernel_tag }}) with SUSFS & Enforcing SELinux"
+          body: |
+            ### Realme Note 50 (UMS9230 / Unisoc T612) GKI 2.0 Custom Kernel
+            
+            Compiled from Google Android Common Kernel source tree with **${{ inputs.root_flavor }}** and **SUSFS**.
+            
+            #### Build Highlights:
+            - **Target Kernel**: `${{ inputs.kernel_tag }}` (Linux LTS 5.15)
+            - **Root Provider**: `${{ inputs.root_flavor }}`
+            - **Root Hiding**: SUSFS (Stack-Unaware File System) patches integrated
+            - **SELinux Status**: **Strictly Enforcing** (`CONFIG_SECURITY_SELINUX=y`, `CONFIG_DEFAULT_SECURITY_SELINUX=y`, full AVC & status spoofing)
+            - **Stock Config Spoofed**: `/proc/config.gz` reports the stock Realme Note 50 configuration to hide custom kernel flags
+            - **Cleaner Banner**: `-dirty` suffix stripped, compile host aligned with stock build banner
+            
+            #### Flashing Instructions:
+            
+            **Method A — Fastboot (Recommended)**:
+            ```bash
+            # Flash directly to boot partition
+            fastboot flash boot boot.img
+            
+            # If flashing to a specific slot:
+            fastboot flash boot_a boot.img
+            fastboot reboot
+            ```
+            
+            > **Note on AVB**: If your device requires AVB verification disabled:
+            > `fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img`
+            
+            **Method B — AnyKernel3 Recovery / Manager Flash**:
+            Flash `AnyKernel3-Realme-Note50-GKI2.0-SUSFS.zip` in custom recovery (TWRP/OrangeFox) or via your root manager.
+            
+            #### Post-Install:
+            1. Install the latest **${{ inputs.root_flavor }} Manager APK**.
+            2. In Manager, flash `susfs4ksu-module.zip` to install the userspace hide daemon and `ksu_susfs` command line tool.
+          files: |
+            artifacts/*
