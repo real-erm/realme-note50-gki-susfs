@@ -333,16 +333,18 @@ jobs:
       - name: Build Userspace SUSFS Tool & Module
         if: ${{ inputs.enable_susfs }}
         run: |
-          mkdir -p artifacts/tools
+          mkdir -p artifacts
           if [ -d "susfs_src/ksu_module_susfs/tools" ]; then
-            echo "[*] Copying prebuilt ksu_susfs userspace binaries..."
-            cp -r susfs_src/ksu_module_susfs/tools/* artifacts/tools/ || true
+            echo "[*] Packaging prebuilt ksu_susfs userspace binaries into zip..."
+            cd susfs_src/ksu_module_susfs/tools
+            zip -j "${{ github.workspace }}/artifacts/ksu_susfs_tools.zip" ./*
+            cd "${{ github.workspace }}"
           fi
 
           if [ -d "susfs_src/ksu_module_susfs" ]; then
             echo "[*] Packaging susfs4ksu Magisk/KSU module..."
             cd susfs_src/ksu_module_susfs
-            zip -r "${{ github.workspace }}/artifacts/susfs4ksu-module.zip" ./* -x ".git*"
+            zip -r "${{ github.workspace }}/artifacts/susfs4ksu-module.zip" ./* -x ".git*" "tools/*"
             cd "${{ github.workspace }}"
           fi
 
@@ -370,10 +372,10 @@ jobs:
           cd "${{ github.workspace }}"
           echo "[+] Generated AnyKernel3 zip"
 
-          # 4. Generate MD5 and SHA256 checksums
+          # 4. Generate MD5 and SHA256 checksums (strictly for files)
           cd artifacts
-          sha256sum * > SHA256SUMS.txt
-          md5sum * > MD5SUMS.txt
+          find . -maxdepth 1 -type f ! -name "*SUMS.txt" -exec sha256sum {} + | sed 's|\./||' > SHA256SUMS.txt
+          find . -maxdepth 1 -type f ! -name "*SUMS.txt" -exec md5sum {} + | sed 's|\./||' > MD5SUMS.txt
           cd ..
 
       - name: Upload Artifacts
