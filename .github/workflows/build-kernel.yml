@@ -4,10 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       kernel_tag:
-        description: 'Android Common Kernel Tag or Branch'
+        description: 'Android Common Kernel Tag or Branch (e.g. android13-5.15.178_r00)'
         required: true
         type: string
         default: 'android13-5.15.178_r00'
+      kernel_release_suffix:
+        description: 'Kernel release vermagic suffix (matches Realme Note 50 stock modules)'
+        required: false
+        type: string
+        default: '-android13-8-g0ff3dab2ed1b-ab36'
       android_version:
         description: 'Android Version'
         required: true
@@ -32,7 +37,7 @@ on:
           - KernelSU-Next
         default: KernelSU
       ksu_branch:
-        description: 'KernelSU / KernelSU-Next Branch or Tag (leave blank for default)'
+        description: 'KernelSU / KernelSU-Next Branch or Tag (leave blank for latest stable)'
         required: false
         type: string
         default: ''
@@ -71,15 +76,12 @@ jobs:
       - name: Checkout Builder Repository
         uses: actions/checkout@v4
 
-      - name: Free Runner Disk Space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: false
+      - name: Maximize Runner Disk Space
+        run: |
+          echo "[*] Cleaning preinstalled toolchains and runtimes to maximize disk space..."
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/powershell /usr/share/swift /usr/local/aws-cli /opt/hostedtoolcache
+          sudo docker image prune -a -f || true
+          df -h
 
       - name: Setup Swap Space (16 GB for Thin-LTO)
         uses: pierotofy/set-swap-space@master
@@ -114,17 +116,24 @@ jobs:
           echo "[*] Initializing repo with branch: $MANIFEST_BRANCH"
           repo init -u https://android.googlesource.com/kernel/manifest -b "$MANIFEST_BRANCH" --depth=1
 
+          DEFAULT_MANIFEST_PATH=".repo/manifests/default.xml"
+          if [ -n "${{ inputs.kernel_tag }}" ] && [ -f "$DEFAULT_MANIFEST_PATH" ]; then
+            echo "[*] Pinning common project in manifest to: refs/tags/${{ inputs.kernel_tag }}"
+            sed -i "s|revision=\"${{ inputs.android_version }}-${{ inputs.kernel_version }}\"|revision=\"refs/tags/${{ inputs.kernel_tag }}\"|g" "$DEFAULT_MANIFEST_PATH" || true
+          fi
+
           echo "[*] Syncing kernel sources..."
           repo sync -c -j$(nproc) --no-tags --no-clone-bundle
 
           cd common
-          # If a specific tag/commit was requested and differs from tip of branch, fetch and checkout
-          if [ -n "${{ inputs.kernel_tag }}" ] && [ "${{ inputs.kernel_tag }}" != "$MANIFEST_BRANCH" ]; then
-            echo "[*] Checking out specified tag: ${{ inputs.kernel_tag }}"
-            git fetch --depth=1 origin tag "${{ inputs.kernel_tag }}" || true
-            git checkout "${{ inputs.kernel_tag }}" || echo "[!] Tag checkout fallback: staying on manifest tip"
+          if [ -n "${{ inputs.kernel_tag }}" ]; then
+            echo "[*] Verifying checkout matches tag: ${{ inputs.kernel_tag }}..."
+            git checkout -f "refs/tags/${{ inputs.kernel_tag }}" 2>/dev/null || \
+            git checkout -f "${{ inputs.kernel_tag }}" 2>/dev/null || \
+            (git fetch --depth=1 https://android.googlesource.com/kernel/common "refs/tags/${{ inputs.kernel_tag }}:refs/tags/${{ inputs.kernel_tag }}" && git checkout -f "refs/tags/${{ inputs.kernel_tag }}") || \
+            echo "[!] Maintaining current branch tip commit"
           fi
-          echo "[*] Current kernel commit: $(git log -1 --oneline)"
+          echo "[+] Verified kernel commit: $(git log -1 --oneline)"
 
       - name: Integrate Root Provider (${{ inputs.root_flavor }})
         run: |
@@ -148,10 +157,16 @@ jobs:
           echo "[*] Cloning susfs4ksu (branch: ${{ inputs.susfs_branch }})..."
           git clone --depth=1 -b "${{ inputs.susfs_branch }}" https://gitlab.com/simonpunk/susfs4ksu.git ../susfs_src
 
-          echo "[*] Patching KernelSU for SUSFS..."
+          TARGET_KSU_DIR="KernelSU"
+          if [ ! -d "KernelSU" ] && [ -d "KernelSU-Next" ]; then
+            TARGET_KSU_DIR="KernelSU-Next"
+          fi
+          echo "[*] Root provider directory: $TARGET_KSU_DIR"
+
+          echo "[*] Patching $TARGET_KSU_DIR for SUSFS..."
           if [ -f ../susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ]; then
-            cp ../susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch KernelSU/
-            cd KernelSU
+            cp ../susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "$TARGET_KSU_DIR/"
+            cd "$TARGET_KSU_DIR"
             patch -p1 --forward < 10_enable_susfs_for_ksu.patch || echo "[!] Notice: Some KernelSU patch hunks already present or skipped"
             cd ..
           fi
@@ -230,6 +245,14 @@ EOF
 
           # Match stock compile host/user from Realme Note 50 banner
           sed -i '/UTS_VERSION=/a LINUX_COMPILE_BY=build-user\nLINUX_COMPILE_HOST=build-host' scripts/mkcompile_h
+
+          # Set vermagic release suffix if specified to match stock vendor modules exactly
+          if [ -n "${{ inputs.kernel_release_suffix }}" ]; then
+            SUFFIX="${{ inputs.kernel_release_suffix }}"
+            [[ "$SUFFIX" != -* ]] && SUFFIX="-$SUFFIX"
+            echo "[*] Setting fixed kernel release suffix: $SUFFIX"
+            sed -i "s|echo \"\$res\"|echo \"$SUFFIX\"|g" scripts/setlocalversion
+          fi
 
           # Disable defconfig check and ABI protected exports enforcement
           cd ..
@@ -353,7 +376,7 @@ EOF
             - **Root Hiding**: SUSFS (Stack-Unaware File System) patches integrated
             - **SELinux Status**: **Strictly Enforcing** (`CONFIG_SECURITY_SELINUX=y`, `CONFIG_DEFAULT_SECURITY_SELINUX=y`, full AVC & status spoofing)
             - **Stock Config Spoofed**: `/proc/config.gz` reports the stock Realme Note 50 configuration to hide custom kernel flags
-            - **Cleaner Banner**: `-dirty` suffix stripped, compile host aligned with stock build banner
+            - **Cleaner Banner & Vermagic**: `-dirty` suffix stripped, compile host aligned with stock build banner (`${{ inputs.kernel_release_suffix }}`)
             
             #### Flashing Instructions:
             
@@ -368,7 +391,7 @@ EOF
             ```
             
             > **Note on AVB**: If your device requires AVB verification disabled:
-            > `fastboot --disable-verity --disable-verification flash vbmeta vbmeta.img`
+            > `fastboot --disable-verity --disable-verification flash vbmeta vbmeta_a.img`
             
             **Method B — AnyKernel3 Recovery / Manager Flash**:
             Flash `AnyKernel3-Realme-Note50-GKI2.0-SUSFS.zip` in custom recovery (TWRP/OrangeFox) or via your root manager.
