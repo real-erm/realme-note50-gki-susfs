@@ -1,12 +1,12 @@
 # Realme Note 50 GKI 2.0 Kernel Builder with SUSFS & Enforcing SELinux
 
-Automated GitHub Actions CI/CD repository for compiling custom **Android Generic Kernel Image (GKI 2.0)** kernels for the **Realme Note 50 (UMS9230 / Unisoc Tiger T612, RMX3834)** with **KernelSU / KernelSU-Next** and **SUSFS (Stack-Unaware File System)** while maintaining **Strict SELinux Enforcement**.
+Automated GitHub Actions CI/CD repository for compiling custom **Android Generic Kernel Image (GKI 2.0)** kernels for the **Realme Note 50 (UMS9230 / Unisoc Tiger T612, RMX3834)** with **SukiSU-Ultra (Spoofed Variant)** / **KernelSU** and **SUSFS (Stack-Unaware File System)** while maintaining **Strict SELinux Enforcement**.
 
 ---
 
 ## 📱 Device & Architecture Specifications
 
-Even though Realme does not publish the device-specific kernel source code for the Realme Note 50, Android's **GKI 2.0 (Generic Kernel Image)** architecture isolates the core Linux kernel from vendor-specific drivers:
+Even though Realme does not publish device-specific kernel sources for the Realme Note 50, Android's **GKI 2.0 (Generic Kernel Image)** architecture isolates the core Linux kernel from vendor-specific drivers:
 
 - **Device**: Realme Note 50 (`RMX3834`, `ums9230_1h10`)
 - **Chipset**: Unisoc Tiger T612 (UMS9230)
@@ -21,22 +21,27 @@ Because the `boot` partition contains pure upstream GKI code, we compile directl
 
 ## 🛡️ Features & Stealth Capabilities
 
-### 1. Properly Enforced SELinux
+### 1. SukiSU-Ultra (Spoofed Variant)
+- **Randomized Package Identity**: Works with SukiSU-Ultra's spoofed manager build. The APK uses randomized package, activity, and service identifiers to evade package name-based root detection.
+- **Dynamic Signature Fallback**: The kernel validates the APK's cryptographic v2 signature directly via `ksu_sig_fallback_run`, granting root access regardless of the randomized package name.
+- **Full SUSFS Integration**: Native SUSFS controls built into the SukiSU-Ultra manager and `ksud` daemon.
+
+### 2. Properly Enforced SELinux
 - **Strictly Enforcing**: SELinux is compiled with `CONFIG_SECURITY_SELINUX=y` and `CONFIG_DEFAULT_SECURITY_SELINUX=y`. The kernel does **not** run in permissive mode (`permissive=0`, `enforcing=1`).
 - **SELinux Status Spoofing**: SUSFS hooks `/sys/fs/selinux/status` so that non-root applications (UID ≥ 10000) always see `enforcing=1` with untouched security context attributes.
 - **AVC Denial Spoofing**: Suppresses and spoofs audit vector log entries in `security/selinux/avc.c` so apps inspecting `dmesg` or logcat do not detect root activity.
 
-### 2. SUSFS (Stack-Unaware File System)
-- **Path & Mount Concealment**: Hides KernelSU overlay mounts, bind mounts, and root binaries from `/proc/mounts`, `/proc/[pid]/mountinfo`, and filesystem scans.
+### 3. SUSFS (Stack-Unaware File System)
+- **Path & Mount Concealment**: Hides root overlay mounts, bind mounts, and root binaries from `/proc/mounts`, `/proc/[pid]/mountinfo`, and filesystem scans.
 - **Symbol Cloaking**: Removes and masks KernelSU and SUSFS identifiers from `/proc/kallsyms`.
 - **Command-line Concealment**: Spoofs `/proc/cmdline` and `/proc/bootconfig` to prevent bootloader unlock detection.
-- **Open Redirection**: Safely redirects file operations away from protected locations.
+- **Open Redirection & Map Hiding**: Safely redirects file operations away from protected locations and hides mmapped files.
 
-### 3. Stock Config Spoofing (`/proc/config.gz`)
+### 4. Stock Config Spoofing (`/proc/config.gz`)
 - Embeds the genuine stock Realme Note 50 defconfig extracted from the device's firmware snapshot into the kernel binary (`config/stock_defconfig`).
 - Banking apps and integrity checkers that decompress `/proc/config.gz` see the clean, unmodified stock Google GKI configuration without root or custom kernel flags.
 
-### 4. Clean Build Banner
+### 5. Clean Build Banner
 - Strips the `-dirty` suffix from `setlocalversion`.
 - Spoofs compile host and user to `build-user@build-host` to match OEM stock release banners.
 
@@ -44,27 +49,24 @@ Because the `boot` partition contains pure upstream GKI code, we compile directl
 
 ## 🚀 How to Build via GitHub Actions
 
-1. Fork or push this repository to your GitHub account.
-2. In your repository on GitHub, navigate to the **Actions** tab.
-3. Select **Build Realme Note 50 GKI 2.0 (SUSFS + SELinux Enforcing)** from the workflow list on the left.
-4. Click **Run workflow**:
+1. In this repository on GitHub, navigate to the **Actions** tab.
+2. Select **Build Realme Note 50 GKI 2.0 (SUSFS + SELinux Enforcing)** from the workflow list on the left.
+3. Click **Run workflow**:
    - **Android Common Kernel Tag or Branch**: `android13-5.15.178_r00` (or `android13-5.15`)
    - **Android Version**: `android13`
    - **Kernel Version**: `5.15`
-   - **Root Provider**: `KernelSU` (or `KernelSU-Next`)
+   - **Root Provider**: `SukiSU-Ultra` (or `KernelSU`, `KernelSU-Next`)
    - **Enable SUSFS**: `true`
    - **Spoof /proc/config.gz**: `true`
    - **Create GitHub Release**: `true`
-5. Click the green **Run workflow** button.
-6. The build takes approximately 30–45 minutes. Once finished:
+4. Click the green **Run workflow** button.
+5. The build runs on GitHub Actions runners (saving local CPU & RAM resources). Once finished:
    - Check the **Releases** page or the **Artifacts** section of the run.
-   - Download the generated ZIP containing `boot.img`, `AnyKernel3-*.zip`, `Image`, and `susfs4ksu-module.zip`.
+   - Download the generated `boot.img`, raw `Image`, `susfs4ksu-module.zip`, and matching **Spoofed Manager APK**.
 
 ---
 
-## ⚡ Flashing Instructions
-
-### Method 1: Fastboot Boot Image Flash (Recommended)
+## ⚡ Flashing Instructions (Fastboot)
 
 1. Put your Realme Note 50 into Fastboot mode:
    - Power off the phone.
@@ -94,23 +96,13 @@ Because the `boot` partition contains pure upstream GKI code, we compile directl
 
 ---
 
-### Method 2: AnyKernel3 Recovery Flash
-
-If your device has a working custom recovery (e.g. TWRP or OrangeFox):
-1. Copy `AnyKernel3-Realme-Note50-GKI2.0-SUSFS.zip` to your internal storage or SD card.
-2. Reboot into recovery.
-3. Flash the zip file. AnyKernel3 will automatically split the boot image, replace the GKI kernel `Image`, and write it back.
-4. Reboot system.
-
----
-
 ## 🔧 Post-Installation Setup
 
-1. **Install Root Manager**:
-   - If built with KernelSU: Install the official [KernelSU Manager APK](https://github.com/tiann/KernelSU/releases).
-   - If built with KernelSU-Next: Install the [KernelSU-Next Manager APK](https://github.com/KernelSU-Next/KernelSU-Next/releases).
+1. **Install Spoofed Manager**:
+   - Install the spoofed manager APK bundled in the release (`SukiSU_v4.2.1-r2_41068-release-spoofed.apk`).
+   - The app installs with a randomized package name to defeat detection. The kernel recognizes and crowns it automatically.
 2. **Install SUSFS Companion Module**:
-   - Open KernelSU Manager.
+   - Open SukiSU Manager.
    - Go to **Modules** -> **Install from file**.
    - Select `susfs4ksu-module.zip` (included in your build release artifacts).
    - Reboot your phone.
@@ -141,7 +133,6 @@ If your device has a working custom recovery (e.g. TWRP or OrangeFox):
 ├── config/
 │   └── stock_defconfig           # Extracted genuine Realme Note 50 stock config
 ├── tools/
-│   ├── AnyKernel3/               # GKI 2.0 AnyKernel3 flashable packaging template
 │   └── mkbootimg/                # Android boot image header v4 tools
 └── README.md                     # Documentation and flashing guide
 ```
@@ -161,6 +152,6 @@ If you encounter any boot issue or want to revert to stock:
 
 ## 📜 Credits & Acknowledgments
 - **Google Android Open Source Project (AOSP)**: Android Common Kernel (ACK) & GKI 2.0
+- **SukiSU-Ultra**: [SukiSU-Ultra/SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra)
 - **KernelSU**: [tiann/KernelSU](https://github.com/tiann/KernelSU) & [KernelSU-Next](https://github.com/KernelSU-Next/KernelSU-Next)
 - **SUSFS**: [simonpunk/susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu)
-- **AnyKernel3**: [osm0sis/AnyKernel3](https://github.com/osm0sis/AnyKernel3)

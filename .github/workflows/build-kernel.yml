@@ -33,11 +33,12 @@ on:
         required: true
         type: choice
         options:
+          - SukiSU-Ultra
           - KernelSU
           - KernelSU-Next
-        default: KernelSU
+        default: SukiSU-Ultra
       ksu_branch:
-        description: 'KernelSU / KernelSU-Next Branch or Tag (leave blank for latest stable)'
+        description: 'Root Provider Branch or Tag (defaults: builtin for SukiSU-Ultra, main for KernelSU, next for KernelSU-Next)'
         required: false
         type: string
         default: ''
@@ -144,7 +145,12 @@ jobs:
       - name: Integrate Root Provider (${{ inputs.root_flavor }})
         run: |
           cd kernel
-          if [ "${{ inputs.root_flavor }}" = "KernelSU-Next" ]; then
+          if [ "${{ inputs.root_flavor }}" = "SukiSU-Ultra" ]; then
+            echo "[*] Installing SukiSU-Ultra (targeting builtin branch)..."
+            KSU_ARG="${{ inputs.ksu_branch }}"
+            [ -z "$KSU_ARG" ] && KSU_ARG="builtin"
+            curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/builtin/kernel/setup.sh" | bash -s "$KSU_ARG"
+          elif [ "${{ inputs.root_flavor }}" = "KernelSU-Next" ]; then
             echo "[*] Installing KernelSU-Next..."
             KSU_ARG="${{ inputs.ksu_branch }}"
             [ -z "$KSU_ARG" ] && KSU_ARG="next"
@@ -169,12 +175,16 @@ jobs:
           fi
           echo "[*] Root provider directory: $TARGET_KSU_DIR"
 
-          echo "[*] Patching $TARGET_KSU_DIR for SUSFS..."
-          if [ -f ../susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ]; then
-            cp ../susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "$TARGET_KSU_DIR/"
-            cd "$TARGET_KSU_DIR"
-            patch -p1 --forward < 10_enable_susfs_for_ksu.patch || echo "[!] Notice: Some KernelSU patch hunks already present or skipped"
-            cd ..
+          if [ "${{ inputs.root_flavor }}" != "SukiSU-Ultra" ]; then
+            echo "[*] Patching $TARGET_KSU_DIR for SUSFS..."
+            if [ -f ../susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch ]; then
+              cp ../susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "$TARGET_KSU_DIR/"
+              cd "$TARGET_KSU_DIR"
+              patch -p1 --forward < 10_enable_susfs_for_ksu.patch || echo "[!] Notice: Some KernelSU patch hunks already present or skipped"
+              cd ..
+            fi
+          else
+            echo "[*] SukiSU-Ultra builtin branch already includes SUSFS inline hooks; skipping 10_enable_susfs_for_ksu.patch"
           fi
 
           echo "[*] Copying SUSFS kernel files into common/..."
@@ -224,7 +234,7 @@ jobs:
           echo "[*] Injecting KSU and SUSFS configuration flags..."
           {
             echo ""
-            echo "# KernelSU Configuration"
+            echo "# KernelSU / SukiSU Configuration"
             echo "CONFIG_KSU=y"
             echo ""
             echo "# SUSFS Configuration"
@@ -241,6 +251,7 @@ jobs:
             echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
             echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
             echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
+            echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
             echo "CONFIG_KSU_SUSFS_SUS_SU=y"
             echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
           } >> "$DEFCONFIG"
@@ -348,7 +359,25 @@ jobs:
             cd "${{ github.workspace }}"
           fi
 
-      - name: Package Boot Image & AnyKernel3
+      - name: Fetch Matching Manager APK
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p artifacts
+          if [ "${{ inputs.root_flavor }}" = "SukiSU-Ultra" ]; then
+            echo "[*] Fetching SukiSU-Ultra spoofed Manager APK..."
+            gh release download -R SukiSU-Ultra/SukiSU-Ultra -p "*spoofed*.apk" -D artifacts/ || {
+              echo "[!] Fallback downloading via GitHub API..."
+              SPOOFED_URL=$(curl -s https://api.github.com/repos/SukiSU-Ultra/SukiSU-Ultra/releases/latest | jq -r '.assets[] | select(.name | test("spoofed.*\\.apk$")) | .browser_download_url' | head -n 1)
+              if [ -n "$SPOOFED_URL" ] && [ "$SPOOFED_URL" != "null" ]; then
+                curl -sSL -o "artifacts/$(basename "$SPOOFED_URL")" "$SPOOFED_URL"
+              fi
+            }
+          fi
+          echo "[+] Manager APK assets:"
+          ls -lh artifacts/*.apk 2>/dev/null || echo "No Manager APK downloaded"
+
+      - name: Package Boot Image & Checksums
         run: |
           mkdir -p artifacts
 
@@ -364,15 +393,7 @@ jobs:
             -o artifacts/boot.img
           echo "[+] Generated artifacts/boot.img ($(ls -lh artifacts/boot.img | awk '{print $5}'))"
 
-          # 3. Package AnyKernel3 flashable zip
-          echo "[*] Creating AnyKernel3 flashable zip..."
-          cp "$BUILT_IMAGE" tools/AnyKernel3/Image
-          cd tools/AnyKernel3
-          zip -r9 "${{ github.workspace }}/artifacts/AnyKernel3-Realme-Note50-GKI2.0-SUSFS.zip" * -x "*.git*" "README.md"
-          cd "${{ github.workspace }}"
-          echo "[+] Generated AnyKernel3 zip"
-
-          # 4. Generate MD5 and SHA256 checksums (strictly for files)
+          # 3. Generate MD5 and SHA256 checksums (strictly for files)
           cd artifacts
           find . -maxdepth 1 -type f ! -name "*SUMS.txt" -exec sha256sum {} + | sed 's|\./||' > SHA256SUMS.txt
           find . -maxdepth 1 -type f ! -name "*SUMS.txt" -exec md5sum {} + | sed 's|\./||' > MD5SUMS.txt
@@ -381,7 +402,7 @@ jobs:
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Realme-Note-50-GKI2.0-${{ inputs.kernel_tag }}-SUSFS
+          name: Realme-Note-50-GKI2.0-${{ inputs.kernel_tag }}-${{ inputs.root_flavor }}-SUSFS
           path: artifacts/*
 
       - name: Create GitHub Release
@@ -389,7 +410,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.kernel_tag }}-${{ inputs.root_flavor }}-SUSFS
-          name: "Realme Note 50 GKI 2.0 Kernel (${{ inputs.kernel_tag }}) with SUSFS & Enforcing SELinux"
+          name: "Realme Note 50 GKI 2.0 Kernel (${{ inputs.kernel_tag }}) with ${{ inputs.root_flavor }} & SUSFS"
           body: |
             ### Realme Note 50 (UMS9230 / Unisoc T612) GKI 2.0 Custom Kernel
             
@@ -397,20 +418,18 @@ jobs:
             
             #### Build Highlights:
             - **Target Kernel**: `${{ inputs.kernel_tag }}` (Linux LTS 5.15)
-            - **Root Provider**: `${{ inputs.root_flavor }}`
+            - **Root Provider**: `${{ inputs.root_flavor }}` (Spoofed manager variant supported)
             - **Root Hiding**: SUSFS (Stack-Unaware File System) patches integrated
             - **SELinux Status**: **Strictly Enforcing** (`CONFIG_SECURITY_SELINUX=y`, `CONFIG_DEFAULT_SECURITY_SELINUX=y`, full AVC & status spoofing)
             - **Stock Config Spoofed**: `/proc/config.gz` reports the stock Realme Note 50 configuration to hide custom kernel flags
             - **Cleaner Banner & Vermagic**: `-dirty` suffix stripped, compile host aligned with stock build banner (`${{ inputs.kernel_release_suffix }}`)
             
-            #### Flashing Instructions:
-            
-            **Method A — Fastboot (Recommended)**:
+            #### Flashing Instructions (Fastboot):
             ```bash
             # Flash directly to boot partition
             fastboot flash boot boot.img
             
-            # If flashing to a specific slot:
+            # If flashing to a specific active slot:
             fastboot flash boot_a boot.img
             fastboot reboot
             ```
@@ -418,11 +437,9 @@ jobs:
             > **Note on AVB**: If your device requires AVB verification disabled:
             > `fastboot --disable-verity --disable-verification flash vbmeta vbmeta_a.img`
             
-            **Method B — AnyKernel3 Recovery / Manager Flash**:
-            Flash `AnyKernel3-Realme-Note50-GKI2.0-SUSFS.zip` in custom recovery (TWRP/OrangeFox) or via your root manager.
-            
             #### Post-Install:
-            1. Install the latest **${{ inputs.root_flavor }} Manager APK**.
-            2. In Manager, flash `susfs4ksu-module.zip` to install the userspace hide daemon and `ksu_susfs` command line tool.
+            1. Install the matching **Manager APK** attached to this release (e.g. `SukiSU_*_spoofed.apk`).
+            2. The spoofed manager uses a randomized package identity to bypass app scanners; the kernel automatically crowns it via signature fallback.
+            3. In Manager, flash `susfs4ksu-module.zip` to install the userspace hide daemon and `ksu_susfs` CLI tools.
           files: |
             artifacts/*
