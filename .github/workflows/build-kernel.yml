@@ -223,6 +223,7 @@ jobs:
               cp ../susfs_src/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch "$TARGET_KSU_DIR/"
               cd "$TARGET_KSU_DIR"
               patch -p1 --forward < 10_enable_susfs_for_ksu.patch || echo "[!] Notice: Some KernelSU patch hunks already present or skipped"
+              rm -f 10_enable_susfs_for_ksu.patch
               cd ..
             fi
           else
@@ -236,17 +237,21 @@ jobs:
           echo "[*] Applying SUSFS kernel patch..."
           SUSFS_PATCH="../susfs_src/kernel_patches/50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch"
           if [ -f "$SUSFS_PATCH" ]; then
+            PATCH_BASENAME="$(basename "$SUSFS_PATCH")"
             cp "$SUSFS_PATCH" common/
             cd common
-            patch -p1 --forward < "$(basename "$SUSFS_PATCH")" || echo "[!] Notice: Handling any version-specific hunk rejects below..."
+            patch -p1 --forward < "$PATCH_BASENAME" || echo "[!] Notice: Handling any version-specific hunk rejects below..."
+            rm -f "$PATCH_BASENAME"
             cd ..
           else
             echo "[!] SUSFS patch $SUSFS_PATCH not found; checking alternatives..."
             ALT_PATCH=$(find ../susfs_src/kernel_patches -name "50_add_susfs*.patch" | head -n 1)
             if [ -n "$ALT_PATCH" ]; then
+              PATCH_BASENAME="$(basename "$ALT_PATCH")"
               cp "$ALT_PATCH" common/
               cd common
-              patch -p1 --forward < "$(basename "$ALT_PATCH")" || true
+              patch -p1 --forward < "$PATCH_BASENAME" || true
+              rm -f "$PATCH_BASENAME"
               cd ..
             fi
           fi
@@ -266,6 +271,13 @@ jobs:
           fi
 
           rm -f fs/namespace.c.rej fs/proc/task_mmu.c.rej
+
+          REMAINING_REJ=$(find . -name "*.rej")
+          if [ -n "$REMAINING_REJ" ]; then
+            echo "::error::Unhandled patch rejects found in kernel source:"
+            echo "$REMAINING_REJ"
+            exit 1
+          fi
           cd ..
 
       - name: Configure Kernel Options (SUSFS + SELinux Enforcing + Stock Config Spoof)
@@ -279,25 +291,20 @@ jobs:
             echo "# KernelSU / SukiSU Configuration"
             echo "CONFIG_KSU=y"
             echo ""
-            echo "# SUSFS Configuration"
+            echo "# SUSFS Configuration (v2.3.0)"
             echo "CONFIG_KSU_SUSFS=y"
             echo "CONFIG_KSU_SUSFS_SUS_PATH=y"
             echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y"
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y"
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y"
             echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y"
-            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y"
-            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y"
             echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y"
             echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y"
             echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y"
             echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y"
             echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y"
             echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
-            echo "CONFIG_KSU_SUSFS_SUS_SU=y"
-            echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
             echo ""
-            echo "# Unisoc Tiger T612 Power Management & Doze / Sleep Support"
+            echo "# Unisoc Tiger T612 (UMS9230) Platform & Doze / Sleep Support"
+            echo "CONFIG_ARCH_SPRD=y"
             echo "CONFIG_ARM_PSCI_CPUIDLE_DOMAIN=y"
             echo "CONFIG_DT_IDLE_STATES=y"
             echo "CONFIG_CPU_IDLE_MULTIPLE_DRIVERS=y"
@@ -328,8 +335,8 @@ jobs:
           # Strip '-dirty' suffix from kernel release
           sed -i "s/printf '%s' -dirty/printf '%s' ''/g" scripts/setlocalversion
 
-          # Match stock compile host/user from Realme Note 50 banner
-          sed -i '/UTS_VERSION=/a LINUX_COMPILE_BY=build-user\nLINUX_COMPILE_HOST=build-host' scripts/mkcompile_h
+          # Match stock compile host, user, and build timestamp from Realme Note 50 banner
+          sed -i 's|^UTS_VERSION="#\$VERSION"|TIMESTAMP="Thu Mar 12 04:26:13 UTC 2026"\nLINUX_COMPILE_BY=build-user\nLINUX_COMPILE_HOST=build-host\nUTS_VERSION="#\$VERSION"|' scripts/mkcompile_h
 
           # Set vermagic release suffix if specified to match stock vendor modules exactly
           if [ -n "${{ inputs.kernel_release_suffix }}" ]; then
@@ -383,11 +390,23 @@ jobs:
             echo "::warning::SUSFS strings not detected in compiled Image. Check patch application."
           fi
 
-          # Verify SELinux configuration in compiled .config
-          CONFIG_PATH="/home/runner/out/.config"
-          if [ -f "$CONFIG_PATH" ]; then
-            echo "[*] Verifying SELinux configs in $CONFIG_PATH:"
-            grep -E "CONFIG_SECURITY_SELINUX|CONFIG_DEFAULT_SECURITY_SELINUX|CONFIG_KSU" "$CONFIG_PATH" || true
+          # Verify SELinux & SUSFS configuration in compiled .config
+          CONFIG_PATH=""
+          if [ -f "/home/runner/out/common/.config" ]; then
+            CONFIG_PATH="/home/runner/out/common/.config"
+          elif [ -f "/home/runner/out/dist/.config" ]; then
+            CONFIG_PATH="/home/runner/out/dist/.config"
+          fi
+
+          if [ -n "$CONFIG_PATH" ]; then
+            echo "[*] Verifying SELinux, KSU, SUSFS & Unisoc configs in $CONFIG_PATH:"
+            grep -E "CONFIG_SECURITY_SELINUX|CONFIG_DEFAULT_SECURITY_SELINUX|CONFIG_KSU|CONFIG_ARCH_SPRD|CONFIG_ARM_PSCI_CPUIDLE_DOMAIN|CONFIG_SUSPEND_SKIP_SYNC" "$CONFIG_PATH" || true
+            if ! grep -q "^CONFIG_SECURITY_SELINUX=y" "$CONFIG_PATH" || ! grep -q "^CONFIG_DEFAULT_SECURITY_SELINUX=y" "$CONFIG_PATH"; then
+              echo "::error::SELinux is not strictly enforced in compiled .config!"
+              exit 1
+            fi
+          else
+            echo "::warning::Compiled .config not found in /home/runner/out/common/.config"
           fi
 
           echo "BUILT_IMAGE=$IMAGE_PATH" >> $GITHUB_ENV
@@ -406,7 +425,7 @@ jobs:
           if [ -d "susfs_src/ksu_module_susfs" ]; then
             echo "[*] Packaging susfs4ksu Magisk/KSU module..."
             cd susfs_src/ksu_module_susfs
-            zip -r "${{ github.workspace }}/artifacts/susfs4ksu-module.zip" ./* -x ".git*" "tools/*"
+            zip -r9 "${{ github.workspace }}/artifacts/susfs4ksu-module.zip" . -x ".git*"
             cd "${{ github.workspace }}"
           fi
 

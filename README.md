@@ -43,9 +43,10 @@ Because the `boot` partition contains pure upstream GKI code, we compile directl
 
 ### 5. Clean Build Banner
 - Strips the `-dirty` suffix from `setlocalversion`.
-- Spoofs compile host and user to `build-user@build-host` to match OEM stock release banners.
+- Spoofs compile host, user (`build-user@build-host`), and build timestamp (`#1 SMP PREEMPT Thu Mar 12 04:26:13 UTC 2026`) in `scripts/mkcompile_h` to match Realme Note 50 stock release banners.
 
 ### 6. Doze Mode & Suspend Stability Fix (Unisoc Tiger T612 / UMS9230)
+- **Spreadtrum / Unisoc Platform Support**: Enables `CONFIG_ARCH_SPRD=y` to match the Realme Note 50 stock kernel configuration.
 - **Hierarchical PSCI CPU Idle Domains**: Enables `CONFIG_ARM_PSCI_CPUIDLE_DOMAIN=y`, `CONFIG_DT_IDLE_STATES=y`, `CONFIG_CPU_IDLE_MULTIPLE_DRIVERS=y`, and `CONFIG_PM_GENERIC_DOMAINS_SLEEP=y`. Properly coordinates power collapse across the asymmetric big.LITTLE clusters (2x A75 + 6x A55) via PSCI firmware, preventing SoC sleep desynchronization.
 - **Watchdog-Safe Suspend**: Sets `CONFIG_SUSPEND_SKIP_SYNC=y` to prevent lengthy storage filesystem syncs during sleep entry from tripping the Unisoc hardware PMIC watchdog timer.
 - **Custom ROM & GSI SELinux Domain Compatibility**: Injects permissive `magisk` and `su` domains into the active kernel policy (`rules.c`) to ensure GSI init property actions (such as `sys.oem_unlock_allowed` toggles during idle maintenance) execute cleanly without `cannot setexeccon` fatal aborts.
@@ -118,9 +119,10 @@ Because the `boot` partition contains pure upstream GKI code, we compile directl
 3. **Verify SUSFS Status**:
    In Termux or an `adb shell` with root (`su`):
    ```bash
-   ksu_susfs susfs_show_version
+   ksu_susfs show version
+   ksu_susfs show enabled_features
    ```
-   You should see the active SUSFS kernel version!
+   You should see the active SUSFS kernel version and enabled stealth features!
 4. **Verify SELinux Status**:
    ```bash
    getenforce
@@ -143,6 +145,7 @@ Because the `boot` partition contains pure upstream GKI code, we compile directl
 │   └── stock_defconfig           # Extracted genuine Realme Note 50 stock config
 ├── tools/
 │   └── mkbootimg/                # Android boot image header v4 tools
+├── BUGFIX_LOG.md                 # Static audit & bugfix history log
 └── README.md                     # Documentation and flashing guide
 ```
 
