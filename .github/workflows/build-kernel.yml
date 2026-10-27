@@ -162,6 +162,48 @@ jobs:
             curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "$KSU_ARG"
           fi
 
+          echo "[*] Adding GSI/custom ROM compatibility domains (magisk, su) to rules.c..."
+          python3 -c '
+          import glob
+          compat = (
+              "\n    /* Compatibility for custom ROMs / GSIs (e.g. crDroid) executing commands in magisk and su domains */\n"
+              "    ksu_type(db, \"magisk\", \"domain\");\n"
+              "    ksu_permissive(db, \"magisk\");\n"
+              "    ksu_typeattribute(db, \"magisk\", \"mlstrustedsubject\");\n"
+              "    ksu_allow(db, \"magisk\", ALL, ALL, ALL);\n"
+              "    ksu_allow(db, \"init\", \"magisk\", ALL, ALL);\n\n"
+              "    ksu_type(db, \"su\", \"domain\");\n"
+              "    ksu_permissive(db, \"su\");\n"
+              "    ksu_typeattribute(db, \"su\", \"mlstrustedsubject\");\n"
+              "    ksu_allow(db, \"su\", ALL, ALL, ALL);\n"
+              "    ksu_allow(db, \"init\", \"su\", ALL, ALL);\n"
+          )
+          for rf in glob.glob("**/selinux/rules.c", recursive=True):
+              with open(rf, "r") as f:
+                  c = f.read()
+              if "\"magisk\", \"domain\"" not in c:
+                  needle = "ksu_allow(db, \"init\", KERNEL_SU_DOMAIN, ALL, ALL);"
+                  if needle in c:
+                      with open(rf, "w") as f:
+                          f.write(c.replace(needle, needle + compat, 1))
+                      print(f"[+] Successfully patched {rf} with magisk and su domains")
+          '
+
+          echo "[*] Sanitizing selinux_hide.c to prevent kernel panics on unhandled CEXPR..."
+          python3 -c '
+          import glob
+          for sh in glob.glob("**/selinux_hide.c", recursive=True):
+              with open(sh, "r") as f:
+                  c = f.read()
+              c = c.replace("BUG();", "return 0;")
+              c = c.replace("BUG_ON(!source);", "if (!source) return;")
+              c = c.replace("BUG_ON(!target);", "if (!target) return;")
+              c = c.replace("BUG_ON(sp != 0);", "if (sp != 0) return 0;")
+              with open(sh, "w") as f:
+                  f.write(c)
+              print(f"[+] Successfully sanitized {sh} (removed raw BUG calls)")
+          '
+
       - name: Apply SUSFS Patches & Integrate Core Files
         if: ${{ inputs.enable_susfs }}
         run: |
@@ -254,6 +296,15 @@ jobs:
             echo "CONFIG_KSU_SUSFS_SUS_MAP=y"
             echo "CONFIG_KSU_SUSFS_SUS_SU=y"
             echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y"
+            echo ""
+            echo "# Unisoc Tiger T612 Power Management & Doze / Sleep Support"
+            echo "CONFIG_ARM_PSCI_CPUIDLE_DOMAIN=y"
+            echo "CONFIG_DT_IDLE_STATES=y"
+            echo "CONFIG_CPU_IDLE_MULTIPLE_DRIVERS=y"
+            echo "CONFIG_PM_GENERIC_DOMAINS=y"
+            echo "CONFIG_PM_GENERIC_DOMAINS_OF=y"
+            echo "CONFIG_PM_GENERIC_DOMAINS_SLEEP=y"
+            echo "CONFIG_SUSPEND_SKIP_SYNC=y"
           } >> "$DEFCONFIG"
 
           echo "[*] Enforcing strict SELinux in defconfig..."
@@ -424,18 +475,22 @@ jobs:
             - **Stock Config Spoofed**: `/proc/config.gz` reports the stock Realme Note 50 configuration to hide custom kernel flags
             - **Cleaner Banner & Vermagic**: `-dirty` suffix stripped, compile host aligned with stock build banner (`${{ inputs.kernel_release_suffix }}`)
             
-            #### Flashing Instructions (Fastboot):
+            #### Flashing Instructions:
             ```bash
-            # Flash directly to boot partition
+            # 1. Enter userspace fastboot (fastbootd) from ADB:
+            adb reboot fastboot
+            
+            # 2. Flash boot.img to boot partition:
             fastboot flash boot boot.img
             
-            # If flashing to a specific active slot:
+            # Or flash to your active slot:
             fastboot flash boot_a boot.img
             fastboot reboot
             ```
             
-            > **Note on AVB**: If your device requires AVB verification disabled:
-            > `fastboot --disable-verity --disable-verification flash vbmeta vbmeta_a.img`
+            > **Note on Realme Note 50 Flashing & AVB**:
+            > - **Always use `adb reboot fastboot`**: Boots into `fastbootd` (recovery userspace fastboot). Do **NOT** use `reboot bootloader`.
+            > - **AVB is Handled**: The device's bootloader unlock exploit automatically handles AVB. You do **not** need to flash `vbmeta` or pass disable-verity flags.
             
             #### Post-Install:
             1. Install the matching **Manager APK** attached to this release (e.g. `SukiSU_*_spoofed.apk`).

@@ -45,6 +45,11 @@ Because the `boot` partition contains pure upstream GKI code, we compile directl
 - Strips the `-dirty` suffix from `setlocalversion`.
 - Spoofs compile host and user to `build-user@build-host` to match OEM stock release banners.
 
+### 6. Doze Mode & Suspend Stability Fix (Unisoc Tiger T612 / UMS9230)
+- **Hierarchical PSCI CPU Idle Domains**: Enables `CONFIG_ARM_PSCI_CPUIDLE_DOMAIN=y`, `CONFIG_DT_IDLE_STATES=y`, `CONFIG_CPU_IDLE_MULTIPLE_DRIVERS=y`, and `CONFIG_PM_GENERIC_DOMAINS_SLEEP=y`. Properly coordinates power collapse across the asymmetric big.LITTLE clusters (2x A75 + 6x A55) via PSCI firmware, preventing SoC sleep desynchronization.
+- **Watchdog-Safe Suspend**: Sets `CONFIG_SUSPEND_SKIP_SYNC=y` to prevent lengthy storage filesystem syncs during sleep entry from tripping the Unisoc hardware PMIC watchdog timer.
+- **Custom ROM & GSI SELinux Domain Compatibility**: Injects permissive `magisk` and `su` domains into the active kernel policy (`rules.c`) to ensure GSI init property actions (such as `sys.oem_unlock_allowed` toggles during idle maintenance) execute cleanly without `cannot setexeccon` fatal aborts.
+
 ---
 
 ## 🚀 How to Build via GitHub Actions
@@ -66,30 +71,34 @@ Because the `boot` partition contains pure upstream GKI code, we compile directl
 
 ---
 
-## ⚡ Flashing Instructions (Fastboot)
+## ⚡ Flashing Instructions (Fastbootd)
 
-1. Put your Realme Note 50 into Fastboot mode:
-   - Power off the phone.
-   - Hold **Volume Down + Power** until the fastboot screen appears (or run `adb reboot bootloader`).
-2. Connect the phone to your PC via USB.
-3. Verify fastboot communication:
+> [!IMPORTANT]
+> **Use fastbootd (`adb reboot fastboot`) — NOT bootloader fastboot (`reboot bootloader`)**:
+> The Realme Note 50 (Unisoc T612) dynamic partition scheme requires userspace fastboot (`fastbootd`) to flash GKI kernel boot images properly.
+> 
+> **AVB (Android Verified Boot)**:
+> The exploit used to unlock the Realme Note 50 bootloader already bypasses and handles AVB automatically. You do **not** need to flash `vbmeta` or use `--disable-verity` flags.
+
+1. Connect the phone to your PC via USB with USB debugging enabled.
+2. Reboot into **fastbootd** (userspace fastboot):
+   ```bash
+   adb reboot fastboot
+   ```
+3. Once the screen shows the fastbootd menu, verify communication:
    ```bash
    fastboot devices
    ```
 4. Flash the custom `boot.img` directly to the boot partition:
    ```bash
-   # Flash active slot (or flash directly to boot)
+   # Flash directly to boot partition
    fastboot flash boot boot.img
    
    # Or flash slot explicitly if needed:
    fastboot flash boot_a boot.img
    fastboot flash boot_b boot.img
    ```
-5. *(Optional / AVB disabled devices)*: If your device requires AVB verification disabled before running modified boot images:
-   ```bash
-   fastboot --disable-verity --disable-verification flash vbmeta vbmeta_a.img
-   ```
-6. Reboot your device:
+5. Reboot your device:
    ```bash
    fastboot reboot
    ```
