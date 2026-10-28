@@ -4,6 +4,27 @@ This document tracks bugs discovered and resolved in the `real-erm/realme-note50
 
 ---
 
+## 2026-10-28 — Live Device Debugging: Momo `"The environment is broken"` Fix & Dual Boot Images
+
+### 1. Fixed Momo 4.4.1 `"The environment is broken: Damaging behavior is detected"` (`mount_hide.c` vs SUSFS)
+- **Symptom**: When `umount_modules` was enabled for Momo 4.4.1 (`io.github.vvb2060.mahoshojo`), Momo reported `"The environment is broken: Damaging behavior is detected (e.g. MagiskHide) and other tests cannot continue"`.
+- **Root Cause**:
+  1. In `libmahoshojo.so` constructor `0x87bc`, Momo opens `/proc/<pid>/mountinfo` (`0x8994`), reads the major:minor device ID (`0:19`) of `/proc`, and compares it (`0x9e0c`) against `fstatat("/proc/<pid>/maps").st_dev`.
+  2. `SukiSU-Ultra` (`builtin` branch) ships `kernel/feature/mount_hide.c` with `ksu_mount_hide_enabled = true` by default, which hooks LSM `file_open` (`ksu_mount_hide_file_open`) and returns `-ENOENT` ("No such file or directory") whenever an umounted or isolated process opens `/proc/<pid>/{mountinfo,mounts,mountstats}`.
+  3. Because `openat("/proc/<pid>/mountinfo")` failed with `-ENOENT`, `proc_major` and `proc_minor` stayed `-1` (`0xffffffff`), causing the `/proc` `st_dev` comparison to fail (`App.get(20) = 1`).
+- **Fix**:
+  - Disabled SukiSU-Ultra's `-ENOENT` `mount_hide` hook in `kernel/feature/mount_hide.c` (`ksu_mount_hide_enabled = false` and `ksu_mount_hide_file_open` returns `0`).
+  - Enabled SUSFS's `susfs_is_hide_sus_mnts_for_non_su_procs_enabled` and `susfs_is_avc_log_spoofing_enabled` static keys by default inside `susfs_init()` in `common/fs/susfs.c` (and in `susfs4ksu-module.zip`), so SUSFS's `susfs_show_mountinfo` filters out KSU mounts (`mnt_id >= DEFAULT_KSU_MNT_ID`) cleanly inside `seq_file` while allowing `/proc/<pid>/mountinfo` to open normally.
+
+### 2. Restored Custom GSI `"magisk"` & `"su"` Domains Under `backup_sepolicy` Protection (`selinux/rules.c`)
+- **Symptom**: Custom GSIs (such as crDroid 12.12 Android 16 GSI) execute `init` commands in `u:r:magisk:s0` or `u:r:su:s0`, which fail `setexeccon` if those domains are missing from `selinux_state.policy`.
+- **Fix**: Restored `"magisk"` and `"su"` domain injection inside `apply_kernelsu_rules_fn` in `selinux/rules.c` **after** `backup_sepolicy = ksu_dup_sepolicy(old_pol)` is snapshotted, and enabled `ksu_selinux_hide_enabled = true; ksu_selinux_hide_running = true;` automatically once `backup_sepolicy` is initialized. This allows `init` (PID 1) to use `magisk`/`su` domains while `selinux_hide.c` validates all user app (`uid >= 10000`) queries against the unpatched `backup_sepolicy`.
+
+### 3. Added Dual SELinux Enforcing (`boot-enforcing.img`) & Permissive (`boot-permissive.img`) Release Packaging
+- **Change**: Added a volatile mode tag (`rmx3834_selinux_mode_tag`) in `security/selinux/selinuxfs.c` and `security/selinux/hooks.c` so CI produces both `boot-enforcing.img` (strict SELinux Enforcing) and `boot-permissive.img` (SELinux Permissive for broken GSIs, while still spoofing `"1"` in `/sys/fs/selinux/enforce` and `/sys/fs/selinux/status` to user apps `uid >= 10000`) from a single kernel build, alongside the spoofed SukiSU Manager APK (`SukiSU_*_spoofed.apk`).
+
+---
+
 ## 2026-10-28 — Second Static Audit: Critical & Root-Hiding Fixes
 
 ### 1. Sanitized `/sys/kernel/kheaders.tar.xz` (`CONFIG_IKHEADERS=y`) Header & `autoconf.h` Leaks (Critical — Root Hiding)

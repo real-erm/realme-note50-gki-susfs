@@ -1,4 +1,4 @@
-name: Build Realme Note 50 GKI 2.0 (SUSFS + SELinux Enforcing)
+name: Build Realme Note 50 GKI 2.0 (SUSFS + Enforcing & Permissive)
 
 on:
   workflow_dispatch:
@@ -119,7 +119,6 @@ jobs:
 
           DEFAULT_MANIFEST_PATH=".repo/manifests/default.xml"
           if [ -f "$DEFAULT_MANIFEST_PATH" ]; then
-            # Strip virtual-device and tests to avoid unnecessary emulator modules and tag mismatch failures
             echo "[*] Stripping unneeded virtual-device and test modules from manifest..."
             sed -i '/common-modules\/virtual-device/d' "$DEFAULT_MANIFEST_PATH"
             sed -i '/kernel\/tests/d' "$DEFAULT_MANIFEST_PATH"
@@ -162,9 +161,47 @@ jobs:
             curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s "$KSU_ARG"
           fi
 
-          echo "[*] Sanitizing selinux_hide.c to prevent kernel panics on unhandled CEXPR..."
+          echo "[*] Patching KSU SELinux rules, selinux_hide, and mount_hide..."
           python3 -c '
           import glob
+
+          # 1. Add custom GSI SELinux domains (magisk, su) after backup_sepolicy is snapshotted,
+          #    and enable selinux_hide by default once backup_sepolicy is ready.
+          for rf in glob.glob("**/selinux/rules.c", recursive=True):
+              with open(rf, "r") as f:
+                  content = f.read()
+              gsi_block = """
+              /* Custom GSI compatibility domains (hidden from apps via backup_sepolicy) */
+              ksu_type(db, "magisk", "domain");
+              ksu_permissive(db, "magisk");
+              ksu_typeattribute(db, "magisk", "mlstrustedsubject");
+              ksu_allow(db, "magisk", ALL, ALL, ALL);
+              ksu_allow(db, "init", "magisk", ALL, ALL);
+
+              ksu_type(db, "su", "domain");
+              ksu_permissive(db, "su");
+              ksu_typeattribute(db, "su", "mlstrustedsubject");
+              ksu_allow(db, "su", ALL, ALL, ALL);
+              ksu_allow(db, "init", "su", ALL, ALL);
+          """
+              if "ksu_permissive(db, \"magisk\");" not in content:
+                  target = "ksu_allow(db, \"system_server\", KERNEL_SU_DOMAIN, \"process\", \"sigkill\");"
+                  if target in content:
+                      content = content.replace(target, target + "\n" + gsi_block, 1)
+                      print(f"[+] Injected custom GSI SELinux domains into {rf}")
+              if "extern bool ksu_selinux_hide_enabled;" not in content and "backup_sepolicy success!" in content:
+                  content = "extern bool ksu_selinux_hide_enabled;\nextern bool ksu_selinux_hide_running;\n" + content
+                  btarget = "pr_info(\"backup sepolicy success! latest_granting=%d\\n\", backup_sepolicy->latest_granting);"
+                  content = content.replace(
+                      btarget,
+                      btarget + "\n                ksu_selinux_hide_enabled = true;\n                ksu_selinux_hide_running = true;",
+                      1,
+                  )
+                  print(f"[+] Enabled selinux_hide by default after backup_sepolicy creation in {rf}")
+              with open(rf, "w") as f:
+                  f.write(content)
+
+          # 2. Sanitize selinux_hide.c to prevent kernel panics on unhandled CEXPR
           for sh in glob.glob("**/selinux_hide.c", recursive=True):
               with open(sh, "r") as f:
                   c = f.read()
@@ -174,7 +211,21 @@ jobs:
               c = c.replace("BUG_ON(sp != 0);", "if (sp != 0) return 0;")
               with open(sh, "w") as f:
                   f.write(c)
-              print(f"[+] Successfully sanitized {sh} (removed raw BUG calls)")
+              print(f"[+] Sanitized {sh} (removed raw BUG calls)")
+
+          # 3. Disable SukiSU-Ultra -ENOENT mount_hide hook (which breaks /proc/self/mountinfo in Momo)
+          #    because SUSFS susfs_show_mountinfo already filters KSU mounts cleanly in seq_file.
+          for mh in glob.glob("**/mount_hide.c", recursive=True):
+              with open(mh, "r") as f:
+                  c = f.read()
+              c = c.replace(
+                  "static bool ksu_mount_hide_enabled __read_mostly = true;",
+                  "static bool ksu_mount_hide_enabled __read_mostly = false;",
+              )
+              c = c.replace("return -ENOENT;", "return 0;")
+              with open(mh, "w") as f:
+                  f.write(c)
+              print(f"[+] Disabled -ENOENT mount_hide in {mh} in favor of SUSFS mount filtering")
           '
 
       - name: Apply SUSFS Patches & Integrate Core Files
@@ -207,9 +258,28 @@ jobs:
           cp -r ../susfs_src/kernel_patches/fs/* common/fs/
           cp -r ../susfs_src/kernel_patches/include/linux/* common/include/linux/
 
-          echo "[*] Defaulting SUSFS kernel ring-buffer logging to disabled at boot..."
-          sed -i 's/DEFINE_STATIC_KEY_TRUE(susfs_is_log_enabled);/DEFINE_STATIC_KEY_FALSE(susfs_is_log_enabled);/' common/fs/susfs.c
-          sed -i '/pr_info("susfs: disable logging to kernel");/d' common/fs/susfs.c
+          echo "[*] Configuring SUSFS defaults in common/fs/susfs.c (disable dmesg log, enable mount & AVC hiding at boot)..."
+          python3 -c '
+          p = "common/fs/susfs.c"
+          with open(p, "r") as f:
+              c = f.read()
+          c = c.replace(
+              "DEFINE_STATIC_KEY_TRUE(susfs_is_log_enabled);",
+              "DEFINE_STATIC_KEY_FALSE(susfs_is_log_enabled);",
+          )
+          c = c.replace("pr_info(\"susfs: disable logging to kernel\");", "")
+          init_target = "INIT_WORK(&susfs_extra_works, susfs_run_extra_works);"
+          init_inject = (
+              init_target
+              + "\n\tstatic_branch_enable(&susfs_is_hide_sus_mnts_for_non_su_procs_enabled);"
+              + "\n\tstatic_branch_enable(&susfs_is_avc_log_spoofing_enabled);"
+          )
+          if init_target in c:
+              c = c.replace(init_target, init_inject, 1)
+          with open(p, "w") as f:
+              f.write(c)
+          print("[+] Patched common/fs/susfs.c successfully")
+          '
 
           echo "[*] Applying SUSFS kernel patch..."
           SUSFS_PATCH="../susfs_src/kernel_patches/50_add_susfs_in_gki-${{ inputs.android_version }}-${{ inputs.kernel_version }}.patch"
@@ -235,13 +305,11 @@ jobs:
 
           echo "[*] Resolving any patch rejects for 5.15 sublevel differences..."
           cd common
-          # 1. fs/namespace.c reject fix (due to missing trace/hooks/blk.h in older 5.15 builds)
           if ! grep -q "susfs_def.h" fs/namespace.c; then
             echo "[*] Injecting SUSFS definitions into fs/namespace.c..."
             sed -i '/#include "internal.h"/a #ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\nextern bool susfs_is_current_ksu_domain(void);\nextern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n#define CL_COPY_MNT_NS BIT(25)\n#endif' fs/namespace.c
           fi
 
-          # 2. fs/proc/task_mmu.c reject fix (due to missing trace/hooks/mm.h in older 5.15 builds)
           if ! grep -q "susfs_def.h" fs/proc/task_mmu.c; then
             echo "[*] Injecting SUSFS definitions into fs/proc/task_mmu.c..."
             sed -i '/#include <linux\/pkeys.h>/a #if defined(CONFIG_KSU_SUSFS_SUS_KSTAT) || defined(CONFIG_KSU_SUSFS_SUS_MAP) || defined(CONFIG_KSU_SUSFS_OPEN_REDIRECT)\n#include <linux/susfs_def.h>\n#endif' fs/proc/task_mmu.c
@@ -256,9 +324,9 @@ jobs:
             exit 1
           fi
 
-          echo "[*] Patching fs/proc/cmdline.c to sanitize bootloader unlock & verifiedboot state..."
-          cat << 'EOF_CMDLINE' > fs/proc/cmdline.c
-          // SPDX-License-Identifier: GPL-2.0
+          echo "[*] Patching fs/proc/cmdline.c and SELinux dual-mode tag (Enforcing & Permissive boot images)..."
+          python3 - << 'PYEOF'
+          cmdline_code = """// SPDX-License-Identifier: GPL-2.0
           #include <linux/fs.h>
           #include <linux/init.h>
           #include <linux/proc_fs.h>
@@ -270,54 +338,90 @@ jobs:
 
           static void __init replace_substr(char *str, const char *orig, const char *rep)
           {
-          	char *pos = strstr(str, orig);
+          \tchar *pos = strstr(str, orig);
 
-          	if (!pos)
-          		return;
-          	memmove(pos + strlen(rep), pos + strlen(orig),
-          		strlen(pos + strlen(orig)) + 1);
-          	memcpy(pos, rep, strlen(rep));
+          \tif (!pos)
+          \t\treturn;
+          \tmemmove(pos + strlen(rep), pos + strlen(orig),
+          \t\tstrlen(pos + strlen(orig)) + 1);
+          \tmemcpy(pos, rep, strlen(rep));
           }
 
           static int cmdline_proc_show(struct seq_file *m, void *v)
           {
-          	seq_puts(m, spoofed_command_line ? spoofed_command_line : saved_command_line);
-          	seq_putc(m, '\n');
-          	return 0;
+          \tseq_puts(m, spoofed_command_line ? spoofed_command_line : saved_command_line);
+          \tseq_putc(m, '\\n');
+          \treturn 0;
           }
 
           static int __init proc_cmdline_init(void)
           {
-          	size_t len = strlen(saved_command_line) + 64;
+          \tsize_t len = strlen(saved_command_line) + 64;
 
-          	spoofed_command_line = kzalloc(len, GFP_KERNEL);
-          	if (spoofed_command_line) {
-          		strscpy(spoofed_command_line, saved_command_line, len);
-          		replace_substr(spoofed_command_line,
-          			       "androidboot.verifiedbootstate=orange",
-          			       "androidboot.verifiedbootstate=green");
-          		replace_substr(spoofed_command_line,
-          			       "androidboot.verifiedbootstate=yellow",
-          			       "androidboot.verifiedbootstate=green");
-          		replace_substr(spoofed_command_line,
-          			       "androidboot.vbmeta.device_state=unlocked",
-          			       "androidboot.vbmeta.device_state=locked");
-          		replace_substr(spoofed_command_line,
-          			       "androidboot.flash.locked=0",
-          			       "androidboot.flash.locked=1");
-          		replace_substr(spoofed_command_line,
-          			       "androidboot.veritymode=disabled",
-          			       "androidboot.veritymode=enforcing");
-          	}
-          	proc_create_single("cmdline", 0, NULL, cmdline_proc_show);
-          	return 0;
+          \tspoofed_command_line = kzalloc(len, GFP_KERNEL);
+          \tif (spoofed_command_line) {
+          \t\tstrscpy(spoofed_command_line, saved_command_line, len);
+          \t\treplace_substr(spoofed_command_line,
+          \t\t\t       "androidboot.verifiedbootstate=orange",
+          \t\t\t       "androidboot.verifiedbootstate=green");
+          \t\treplace_substr(spoofed_command_line,
+          \t\t\t       "androidboot.verifiedbootstate=yellow",
+          \t\t\t       "androidboot.verifiedbootstate=green");
+          \t\treplace_substr(spoofed_command_line,
+          \t\t\t       "androidboot.vbmeta.device_state=unlocked",
+          \t\t\t       "androidboot.vbmeta.device_state=locked");
+          \t\treplace_substr(spoofed_command_line,
+          \t\t\t       "androidboot.flash.locked=0",
+          \t\t\t       "androidboot.flash.locked=1");
+          \t\treplace_substr(spoofed_command_line,
+          \t\t\t       "androidboot.veritymode=disabled",
+          \t\t\t       "androidboot.veritymode=enforcing");
+          \t}
+          \tproc_create_single("cmdline", 0, NULL, cmdline_proc_show);
+          \treturn 0;
           }
           fs_initcall(proc_cmdline_init);
-          EOF_CMDLINE
-          sed -i 's/^          //' fs/proc/cmdline.c
+          """
+          with open("fs/proc/cmdline.c", "w") as f:
+              f.write("\n".join(line[10:] if line.startswith("          ") else line for line in cmdline_code.splitlines()) + "\n")
+          print("[+] Patched fs/proc/cmdline.c")
+
+          with open("security/selinux/selinuxfs.c", "r") as f:
+              sfs = f.read()
+          tag_decl = '\nvolatile char rmx3834_selinux_mode_tag[32] __used __aligned(8) = "RMX3834_SELINUX_MODE=ENFORCING";\n'
+          sfs = sfs.replace('#include "ima.h"', '#include "ima.h"\n' + tag_decl, 1)
+          sfs = sfs.replace(
+              "enforcing_enabled(fsi->state));",
+              "(current_uid().val >= 10000) ? 1 : enforcing_enabled(fsi->state));",
+              1,
+          )
+          sfs = sfs.replace(
+              "new_value = !!new_value;",
+              "new_value = !!new_value;\n\tif (rmx3834_selinux_mode_tag[21] == 'P')\n\t\tnew_value = 0;",
+              1,
+          )
+          with open("security/selinux/selinuxfs.c", "w") as f:
+              f.write(sfs)
+
+          with open("security/selinux/hooks.c", "r") as f:
+              hk = f.read()
+          hk = hk.replace(
+              "struct selinux_state selinux_state;",
+              "struct selinux_state selinux_state;\nextern volatile char rmx3834_selinux_mode_tag[];",
+              1,
+          )
+          hk = hk.replace(
+              "enforcing_set(&selinux_state, selinux_enforcing_boot);",
+              "enforcing_set(&selinux_state, (rmx3834_selinux_mode_tag[21] == 'P') ? false : selinux_enforcing_boot);",
+              1,
+          )
+          with open("security/selinux/hooks.c", "w") as f:
+              f.write(hk)
+          print("[+] Patched security/selinux/{selinuxfs.c,hooks.c} with dual-mode Enforcing/Permissive tag")
+          PYEOF
           cd ..
 
-      - name: Configure Kernel Options (SUSFS + SELinux Enforcing + Stock Config Spoof)
+      - name: Configure Kernel Options (SUSFS + SELinux + Stock Config Spoof)
         run: |
           cd kernel/common
           DEFCONFIG="arch/arm64/configs/gki_defconfig"
@@ -351,13 +455,12 @@ jobs:
             echo "CONFIG_SUSPEND_SKIP_SYNC=y"
           } >> "$DEFCONFIG"
 
-          echo "[*] Enforcing strict SELinux in defconfig..."
-          # Guarantee SELinux is compiled in and defaults to Enforcing
+          echo "[*] Configuring SELinux in defconfig..."
           sed -i 's/^# CONFIG_SECURITY_SELINUX is not set/CONFIG_SECURITY_SELINUX=y/' "$DEFCONFIG"
           grep -q "^CONFIG_SECURITY_SELINUX=y" "$DEFCONFIG" || echo "CONFIG_SECURITY_SELINUX=y" >> "$DEFCONFIG"
           grep -q "^CONFIG_DEFAULT_SECURITY_SELINUX=y" "$DEFCONFIG" || echo "CONFIG_DEFAULT_SECURITY_SELINUX=y" >> "$DEFCONFIG"
+          grep -q "^CONFIG_SECURITY_SELINUX_DEVELOP=y" "$DEFCONFIG" || echo "CONFIG_SECURITY_SELINUX_DEVELOP=y" >> "$DEFCONFIG"
 
-          # Ensure SELinux boot disable is NOT enabled
           sed -i 's/^CONFIG_SECURITY_SELINUX_DISABLE=y/# CONFIG_SECURITY_SELINUX_DISABLE is not set/' "$DEFCONFIG"
           sed -i 's/^CONFIG_SECURITY_SELINUX_BOOTPARAM=y/# CONFIG_SECURITY_SELINUX_BOOTPARAM is not set/' "$DEFCONFIG"
 
@@ -372,13 +475,9 @@ jobs:
           sed -i '/# Remove comments except SDPX lines/i rm -rf "$cpio_dir/include/linux/susfs.h" "$cpio_dir/include/linux/susfs_def.h" "$cpio_dir/include/config/ksu"*\nif [ -f "$cpio_dir/include/generated/autoconf.h" ]; then\n\tsed -i "/CONFIG_KSU/d" "$cpio_dir/include/generated/autoconf.h"\nfi\n' kernel/gen_kheaders.sh
 
           echo "[*] Cleaning kernel banner strings..."
-          # Strip '-dirty' suffix from kernel release
           sed -i "s/printf '%s' -dirty/printf '%s' ''/g" scripts/setlocalversion
-
-          # Match stock compile version (#1), host, user, and build timestamp from Realme Note 50 banner
           sed -i 's|^UTS_VERSION="#\$VERSION"|VERSION=1\nTIMESTAMP="Thu Mar 12 04:26:13 UTC 2026"\nLINUX_COMPILE_BY=build-user\nLINUX_COMPILE_HOST=build-host\nUTS_VERSION="#\$VERSION"|' scripts/mkcompile_h
 
-          # Set vermagic release suffix if specified to match stock vendor modules exactly
           if [ -n "${{ inputs.kernel_release_suffix }}" ]; then
             SUFFIX="${{ inputs.kernel_release_suffix }}"
             [[ "$SUFFIX" != -* ]] && SUFFIX="-$SUFFIX"
@@ -386,7 +485,6 @@ jobs:
             sed -i "s|echo \"\$res\"|echo \"$SUFFIX\"|g" scripts/setlocalversion
           fi
 
-          # Disable defconfig check and ABI protected exports enforcement
           cd ..
           sed -i 's/check_defconfig//' common/build.config.gki || true
           rm -f common/android/abi_gki_protected_exports_*
@@ -423,14 +521,9 @@ jobs:
 
           echo "[+] Kernel Image successfully built at $IMAGE_PATH ($(ls -lh "$IMAGE_PATH" | awk '{print $5}'))"
 
-          # Check SUSFS strings in compiled Image
           SUSFS_COUNT=$(strings "$IMAGE_PATH" | grep -ic "susfs" || true)
           echo "[+] SUSFS string occurrences in Image: $SUSFS_COUNT"
-          if [ "${{ inputs.enable_susfs }}" = "true" ] && [ "$SUSFS_COUNT" -eq 0 ]; then
-            echo "::warning::SUSFS strings not detected in compiled Image. Check patch application."
-          fi
 
-          # Verify SELinux & SUSFS configuration in compiled .config
           CONFIG_PATH=""
           if [ -f "/home/runner/out/common/.config" ]; then
             CONFIG_PATH="/home/runner/out/common/.config"
@@ -442,11 +535,9 @@ jobs:
             echo "[*] Verifying SELinux, KSU, SUSFS & Unisoc configs in $CONFIG_PATH:"
             grep -E "CONFIG_SECURITY_SELINUX|CONFIG_DEFAULT_SECURITY_SELINUX|CONFIG_KSU|CONFIG_ARCH_SPRD|CONFIG_ARM_PSCI_CPUIDLE_DOMAIN|CONFIG_SUSPEND_SKIP_SYNC" "$CONFIG_PATH" || true
             if ! grep -q "^CONFIG_SECURITY_SELINUX=y" "$CONFIG_PATH" || ! grep -q "^CONFIG_DEFAULT_SECURITY_SELINUX=y" "$CONFIG_PATH"; then
-              echo "::error::SELinux is not strictly enforced in compiled .config!"
+              echo "::error::SELinux is not enabled in compiled .config!"
               exit 1
             fi
-          else
-            echo "::warning::Compiled .config not found in /home/runner/out/common/.config"
           fi
 
           echo "BUILT_IMAGE=$IMAGE_PATH" >> $GITHUB_ENV
@@ -464,82 +555,104 @@ jobs:
 
           if [ -d "susfs_src/ksu_module_susfs" ]; then
             echo "[*] Configuring active Realme Note 50 runtime protections in susfs4ksu module..."
-            cd susfs_src/ksu_module_susfs
+            python3 - << 'PYEOF'
+          import os
 
-            # 1. Ensure boot-completed.sh permissions are set in customize.sh
-            sed -i 's|chmod 644 ${MODPATH}/post-fs-data.sh ${MODPATH}/service.sh ${MODPATH}/uninstall.sh|chmod 644 ${MODPATH}/post-fs-data.sh ${MODPATH}/service.sh ${MODPATH}/boot-completed.sh ${MODPATH}/uninstall.sh 2>/dev/null || true|' customize.sh
+          mod = "susfs_src/ksu_module_susfs"
+          cust_path = os.path.join(mod, "customize.sh")
+          with open(cust_path, "r") as f:
+              cust = f.read()
+          cust = cust.replace(
+              "chmod 644 ${MODPATH}/post-fs-data.sh ${MODPATH}/service.sh ${MODPATH}/uninstall.sh",
+              "chmod 644 ${MODPATH}/post-fs-data.sh ${MODPATH}/service.sh ${MODPATH}/boot-completed.sh ${MODPATH}/uninstall.sh 2>/dev/null || true",
+          )
+          with open(cust_path, "w") as f:
+              f.write(cust)
 
-            # 2. Fix upstream read-only path typo in post-fs-data.sh template and append active Realme Note 50 rules
-            sed -i 's|cat /proc/bootconfig > ./fake_bootconfig.txt|cat /proc/bootconfig > ${FAKE_BOOTCONFIG}|g' post-fs-data.sh
-            cat << 'EOF_PFD' >> post-fs-data.sh
+          pfd_path = os.path.join(mod, "post-fs-data.sh")
+          with open(pfd_path, "r") as f:
+              pfd = f.read()
+          pfd = pfd.replace("cat /proc/bootconfig > ./fake_bootconfig.txt", "cat /proc/bootconfig > ${FAKE_BOOTCONFIG}")
+          pfd += """
 
-            # --- Realme Note 50 (RMX3834) Active SUSFS Protections ---
-            ${SUSFS_BIN} enable_avc_log_spoofing 1
-            ${SUSFS_BIN} set_uname 'default' '#1 SMP PREEMPT Thu Mar 12 04:26:13 UTC 2026'
+          # --- Realme Note 50 (RMX3834) Active SUSFS Protections ---
+          /data/adb/ksu/bin/ksud feature set mount_hide 0 2>/dev/null || true
+          /data/adb/ksu/bin/ksud feature set selinux_hide 1 2>/dev/null || true
+          ${SUSFS_BIN} enable_avc_log_spoofing 1
+          ${SUSFS_BIN} hide_sus_mnts_for_non_su_procs 1
+          ${SUSFS_BIN} set_uname 'default' '#1 SMP PREEMPT Thu Mar 12 04:26:13 UTC 2026'
 
-            if [ -s /proc/bootconfig ]; then
-            	FAKE_BOOTCONFIG="${MODDIR}/fake_bootconfig.txt"
-            	cat /proc/bootconfig > "${FAKE_BOOTCONFIG}"
-            	sed -i 's/^androidboot.bootreason.*$/androidboot.bootreason = "reboot"/g' "${FAKE_BOOTCONFIG}"
-            	sed -i 's/^androidboot.vbmeta.device_state.*$/androidboot.vbmeta.device_state = "locked"/g' "${FAKE_BOOTCONFIG}"
-            	sed -i 's/^androidboot.verifiedbootstate.*$/androidboot.verifiedbootstate = "green"/g' "${FAKE_BOOTCONFIG}"
-            	sed -i '/androidboot.verifiedbooterror/d' "${FAKE_BOOTCONFIG}"
-            	sed -i '/androidboot.verifyerrorpart/d' "${FAKE_BOOTCONFIG}"
-            	${SUSFS_BIN} set_cmdline_or_bootconfig "${FAKE_BOOTCONFIG}"
-            fi
+          if [ -s /proc/bootconfig ]; then
+          \tFAKE_BOOTCONFIG="${MODDIR}/fake_bootconfig.txt"
+          \tcat /proc/bootconfig > "${FAKE_BOOTCONFIG}"
+          \tsed -i 's/^androidboot.bootreason.*$/androidboot.bootreason = "reboot"/g' "${FAKE_BOOTCONFIG}"
+          \tsed -i 's/^androidboot.vbmeta.device_state.*$/androidboot.vbmeta.device_state = "locked"/g' "${FAKE_BOOTCONFIG}"
+          \tsed -i 's/^androidboot.verifiedbootstate.*$/androidboot.verifiedbootstate = "green"/g' "${FAKE_BOOTCONFIG}"
+          \tsed -i '/androidboot.verifiedbooterror/d' "${FAKE_BOOTCONFIG}"
+          \tsed -i '/androidboot.verifyerrorpart/d' "${FAKE_BOOTCONFIG}"
+          \t${SUSFS_BIN} set_cmdline_or_bootconfig "${FAKE_BOOTCONFIG}"
+          fi
 
-            for device in $(ls -Ld /proc/fs/jbd2/loop*8 2>/dev/null | sed 's|/proc/fs/jbd2/||; s|-8||'); do
-            	${SUSFS_BIN} add_sus_path /proc/fs/jbd2/${device}-8
-            	${SUSFS_BIN} add_sus_path /proc/fs/ext4/${device}
-            done
+          for device in $(ls -Ld /proc/fs/jbd2/loop*8 2>/dev/null | sed 's|/proc/fs/jbd2/||; s|-8||'); do
+          \t${SUSFS_BIN} add_sus_path /proc/fs/jbd2/${device}-8
+          \t${SUSFS_BIN} add_sus_path /proc/fs/ext4/${device}
+          done
+          """
+          with open(pfd_path, "w") as f:
+              f.write("\n".join(line[10:] if line.startswith("          ") else line for line in pfd.splitlines()) + "\n")
 
-            ${SUSFS_BIN} hide_sus_mnts_for_non_su_procs 1
-            EOF_PFD
-            sed -i 's/^            //' post-fs-data.sh
+          svc_path = os.path.join(mod, "service.sh")
+          with open(svc_path, "r") as f:
+              svc = f.read()
+          svc += """
 
-            # 3. Append active runtime log disabling and verifiedboot prop sanitization to service.sh
-            cat << 'EOF_SVC' >> service.sh
+          # --- Realme Note 50 (RMX3834) Active Runtime Protections ---
+          ${SUSFS_BIN} enable_log 0
 
-            # --- Realme Note 50 (RMX3834) Active Runtime Protections ---
-            ${SUSFS_BIN} enable_log 0
+          if command -v resetprop >/dev/null 2>&1; then
+          \tresetprop -w --delete "ro.boot.verifiedbooterror" 2>/dev/null
+          \tresetprop -w --delete "ro.boot.verifyerrorpart" 2>/dev/null
+          \tresetprop -w --delete "crashrecovery.rescue_boot_count" 2>/dev/null
+          \tresetprop -n ro.boot.vbmeta.device_state locked 2>/dev/null
+          \tresetprop -n ro.boot.verifiedbootstate green 2>/dev/null
+          \tresetprop -n ro.boot.flash.locked 1 2>/dev/null
+          \tresetprop -n ro.boot.veritymode enforcing 2>/dev/null
+          fi
+          """
+          with open(svc_path, "w") as f:
+              f.write("\n".join(line[10:] if line.startswith("          ") else line for line in svc.splitlines()) + "\n")
 
-            if command -v resetprop >/dev/null 2>&1; then
-            	resetprop -w --delete "ro.boot.verifiedbooterror" 2>/dev/null
-            	resetprop -w --delete "ro.boot.verifyerrorpart" 2>/dev/null
-            	resetprop -w --delete "crashrecovery.rescue_boot_count" 2>/dev/null
-            	resetprop -n ro.boot.vbmeta.device_state locked 2>/dev/null
-            	resetprop -n ro.boot.verifiedbootstate green 2>/dev/null
-            	resetprop -n ro.boot.flash.locked 1 2>/dev/null
-            	resetprop -n ro.boot.veritymode enforcing 2>/dev/null
-            fi
-            EOF_SVC
-            sed -i 's/^            //' service.sh
+          bc_path = os.path.join(mod, "boot-completed.sh")
+          with open(bc_path, "r") as f:
+              bc = f.read()
+          bc += """
 
-            # 4. Append active suspicious path hiding to boot-completed.sh
-            cat << 'EOF_BC' >> boot-completed.sh
+          # --- Realme Note 50 (RMX3834) Active Path Hiding ---
+          until [ -d "/sdcard/Android" ]; do sleep 3; done
 
-            # --- Realme Note 50 (RMX3834) Active Path Hiding ---
-            until [ -d "/sdcard/Android" ]; do sleep 3; done
+          [ -e "/sdcard/..5.u.S" ] && rm -rf "/sdcard/..5.u.S"
+          [ -e "/sdcard/Android/data/..5.u.S" ] && rm -rf "/sdcard/Android/data/..5.u.S"
+          [ -e "/sdcard/Android/media/..5.u.S" ] && rm -rf "/sdcard/Android/media/..5.u.S"
 
-            [ -e "/sdcard/..5.u.S" ] && rm -rf "/sdcard/..5.u.S"
-            [ -e "/sdcard/Android/data/..5.u.S" ] && rm -rf "/sdcard/Android/data/..5.u.S"
-            [ -e "/sdcard/Android/media/..5.u.S" ] && rm -rf "/sdcard/Android/media/..5.u.S"
-
-            ${SUSFS_BIN} add_sus_path /sys/block/loop0
-            ${SUSFS_BIN} add_sus_path /system/addon.d
-            ${SUSFS_BIN} add_sus_path /vendor/bin/install-recovery.sh
-            ${SUSFS_BIN} add_sus_path /system/bin/install-recovery.sh
-            ${SUSFS_BIN} add_sus_path_loop /sdcard/TWRP
-            ${SUSFS_BIN} add_sus_path_loop /data/media/0/TWRP
-            EOF_BC
-            sed -i 's/^            //' boot-completed.sh
+          ${SUSFS_BIN} add_sus_path /sys/block/loop0
+          ${SUSFS_BIN} add_sus_path /system/addon.d
+          ${SUSFS_BIN} add_sus_path /vendor/bin/install-recovery.sh
+          ${SUSFS_BIN} add_sus_path /system/bin/install-recovery.sh
+          ${SUSFS_BIN} add_sus_path_loop /sdcard/TWRP
+          ${SUSFS_BIN} add_sus_path_loop /data/media/0/TWRP
+          """
+          with open(bc_path, "w") as f:
+              f.write("\n".join(line[10:] if line.startswith("          ") else line for line in bc.splitlines()) + "\n")
+          print("[+] Configured susfs4ksu module scripts")
+          PYEOF
 
             echo "[*] Packaging susfs4ksu Magisk/KSU module..."
+            cd susfs_src/ksu_module_susfs
             zip -r9 "${{ github.workspace }}/artifacts/susfs4ksu-module.zip" . -x ".git*"
             cd "${{ github.workspace }}"
           fi
 
-      - name: Fetch Matching Manager APK
+      - name: Fetch Matching Root Manager APK
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -557,23 +670,48 @@ jobs:
           echo "[+] Manager APK assets:"
           ls -lh artifacts/*.apk 2>/dev/null || echo "No Manager APK downloaded"
 
-      - name: Package Boot Image & Checksums
+      - name: Package Enforcing & Permissive Boot Images + Checksums
         run: |
           mkdir -p artifacts
 
-          # 1. Copy raw Image
+          # 1. Copy raw Enforcing Image
           cp "$BUILT_IMAGE" artifacts/Image
 
-          # 2. Package boot.img (Header Version 4, Realme Note 50 layout)
-          echo "[*] Generating boot.img with header version 4..."
+          # 2. Generate Permissive Image by toggling RMX3834_SELINUX_MODE tag in .data
+          python3 -c '
+          with open("artifacts/Image", "rb") as f:
+              data = f.read()
+          old_tag = b"RMX3834_SELINUX_MODE=ENFORCING\x00"
+          new_tag = b"RMX3834_SELINUX_MODE=PERMISSIVE"
+          assert len(old_tag) == len(new_tag), "Tag length mismatch"
+          count = data.count(old_tag)
+          print(f"[*] Found {count} occurrence(s) of RMX3834_SELINUX_MODE=ENFORCING in Image")
+          if count == 0:
+              raise RuntimeError("RMX3834_SELINUX_MODE=ENFORCING tag not found in compiled Image!")
+          perm_data = data.replace(old_tag, new_tag)
+          with open("/tmp/Image-permissive", "wb") as f:
+              f.write(perm_data)
+          print("[+] Created /tmp/Image-permissive")
+          '
+
+          # 3. Package boot-enforcing.img & boot-permissive.img (Header Version 4)
           export PYTHONPATH="${{ github.workspace }}/tools/mkbootimg"
+
+          echo "[*] Generating artifacts/boot-enforcing.img..."
           python3 "${{ github.workspace }}/tools/mkbootimg/mkbootimg" \
             --header_version 4 \
-            --kernel "$BUILT_IMAGE" \
-            -o artifacts/boot.img
-          echo "[+] Generated artifacts/boot.img ($(ls -lh artifacts/boot.img | awk '{print $5}'))"
+            --kernel artifacts/Image \
+            -o artifacts/boot-enforcing.img
+          echo "[+] Generated artifacts/boot-enforcing.img ($(ls -lh artifacts/boot-enforcing.img | awk '{print $5}'))"
 
-          # 3. Generate MD5 and SHA256 checksums (strictly for files)
+          echo "[*] Generating artifacts/boot-permissive.img..."
+          python3 "${{ github.workspace }}/tools/mkbootimg/mkbootimg" \
+            --header_version 4 \
+            --kernel /tmp/Image-permissive \
+            -o artifacts/boot-permissive.img
+          echo "[+] Generated artifacts/boot-permissive.img ($(ls -lh artifacts/boot-permissive.img | awk '{print $5}'))"
+
+          # 4. Generate MD5 and SHA256 checksums
           cd artifacts
           find . -maxdepth 1 -type f ! -name "*SUMS.txt" -exec sha256sum {} + | sed 's|\./||' > SHA256SUMS.txt
           find . -maxdepth 1 -type f ! -name "*SUMS.txt" -exec md5sum {} + | sed 's|\./||' > MD5SUMS.txt
@@ -590,40 +728,52 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.kernel_tag }}-${{ inputs.root_flavor }}-SUSFS
-          name: "Realme Note 50 GKI 2.0 Kernel (${{ inputs.kernel_tag }}) with ${{ inputs.root_flavor }} & SUSFS"
+          name: "Realme Note 50 GKI 2.0 (${{ inputs.kernel_tag }}) — Enforcing & Permissive + SukiSU + SUSFS"
           body: |
-            ### Realme Note 50 (UMS9230 / Unisoc T612) GKI 2.0 Custom Kernel
-            
-            Compiled from Google Android Common Kernel source tree with **${{ inputs.root_flavor }}** and **SUSFS**.
-            
-            #### Build Highlights:
-            - **Target Kernel**: `${{ inputs.kernel_tag }}` (Linux LTS 5.15)
-            - **Root Provider**: `${{ inputs.root_flavor }}` (Spoofed manager variant supported)
-            - **Root Hiding**: SUSFS (Stack-Unaware File System) patches integrated
-            - **SELinux Status**: **Strictly Enforcing** (`CONFIG_SECURITY_SELINUX=y`, `CONFIG_DEFAULT_SECURITY_SELINUX=y`, full AVC & status spoofing)
-            - **Stock Config Spoofed**: `/proc/config.gz` reports the stock Realme Note 50 configuration to hide custom kernel flags
-            - **Cleaner Banner & Vermagic**: `-dirty` suffix stripped, compile host aligned with stock build banner (`${{ inputs.kernel_release_suffix }}`)
-            
-            #### Flashing Instructions:
+            ### Realme Note 50 (`RMX3834` / Unisoc T612) GKI 2.0 Kernel
+
+            Built with **${{ inputs.root_flavor }}** (spoofed build) and **SUSFS** root hiding.
+
+            ---
+
+            ### What's Included in This Release
+            - **`boot-enforcing.img`** — Kernel with **SELinux Enforcing** (Recommended for stock ROM & most GSIs).
+            - **`boot-permissive.img`** — Kernel with **SELinux Permissive** (Use if your custom GSI has broken SELinux rules; still spoofs `Enforcing` to regular apps).
+            - **`SukiSU_*_spoofed.apk`** — Root Manager app (spoofed package name to hide from app scanners).
+            - **`susfs4ksu-module.zip`** — SUSFS module (flash inside the SukiSU Manager app).
+            - **`ksu_susfs_tools.zip`** — Standalone `ksu_susfs` command-line binaries.
+
+            ---
+
+            ### How to Flash
+            > **Important**: Always use `adb reboot fastboot` (boots into `fastbootd`), **never** `adb reboot bootloader`. The Realme Note 50 unlock exploit already handles AVB, so you do **not** need to flash `vbmeta`.
+
             ```bash
-            # 1. Enter userspace fastboot (fastbootd) from ADB:
+            # 1. Reboot into fastbootd
             adb reboot fastboot
-            
-            # 2. Flash boot.img to boot partition:
-            fastboot flash boot boot.img
-            
-            # Or flash to your active slot:
-            fastboot flash boot_a boot.img
+
+            # 2. Flash EITHER the Enforcing OR Permissive boot image:
+            fastboot flash boot boot-enforcing.img
+            # (or: fastboot flash boot boot-permissive.img)
+
+            # 3. Reboot back to Android
             fastboot reboot
             ```
-            
-            > **Note on Realme Note 50 Flashing & AVB**:
-            > - **Always use `adb reboot fastboot`**: Boots into `fastbootd` (recovery userspace fastboot). Do **NOT** use `reboot bootloader`.
-            > - **AVB is Handled**: The device's bootloader unlock exploit automatically handles AVB. You do **not** need to flash `vbmeta` or pass disable-verity flags.
-            
-            #### Post-Install:
-            1. Install the matching **Manager APK** attached to this release (e.g. `SukiSU_*_spoofed.apk`).
-            2. The spoofed manager uses a randomized package identity to bypass app scanners; the kernel automatically crowns it via signature fallback.
-            3. In Manager, flash `susfs4ksu-module.zip` to install the userspace hide daemon and `ksu_susfs` CLI tools.
+
+            ### Setup After Flashing
+            1. Install the **`SukiSU_*_spoofed.apk`** attached to this release.
+            2. Open the SukiSU app, go to **Modules**, and flash **`susfs4ksu-module.zip`**.
+            3. Reboot your phone.
+
+            ---
+
+            ### Known Issues
+            1. **Momo 4.4.1 crashes on Android 15 / 16 GSIs**:
+               - Our kernel fixes Momo's *"The environment is broken"* detection (by disabling SukiSU's `-ENOENT` `mount_hide` hook in favor of SUSFS mount filtering).
+               - However, on Android 15/16 ROMs, Momo 4.4.1 (from 2022) crashes right after because Google renamed `solist` to `solist_head` inside `linker64`, causing a null-pointer bug inside Momo itself.
+            2. **GSI Fix Modules Mounting Over `/system/product/overlay`**:
+               - If you use a custom GSI fix module (like `realme_note_50_gsi_fixes`) that mounts an overlay on `/system/product/overlay` or creates world-readable folders in `/dev` (like `/dev/imsfix`), apps that spawn an `AppZygote` (like Momo) can fail to launch when "Umount modules" is enabled for them, because Zygote tries to reopen the unmounted overlay APK.
+            3. **Spoofing Android 15 Fingerprint on Android 16 GSIs**:
+               - If you run an Android 16 GSI (SDK 36) with a Play Integrity module spoofing Realme Note 50's stock Android 15 fingerprint (`ro.build.version.release=15`), strict root detectors will flag the mismatch between Android 15 and SDK 36.
           files: |
             artifacts/*

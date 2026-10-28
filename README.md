@@ -1,169 +1,87 @@
-# Realme Note 50 GKI 2.0 Kernel Builder with SUSFS & Enforcing SELinux
+# Realme Note 50 (`RMX3834`) GKI 2.0 Kernel — SukiSU-Ultra & SUSFS
 
-Automated GitHub Actions CI/CD repository for compiling custom **Android Generic Kernel Image (GKI 2.0)** kernels for the **Realme Note 50 (UMS9230 / Unisoc Tiger T612, RMX3834)** with **SukiSU-Ultra (Spoofed Variant)** / **KernelSU** and **SUSFS (Stack-Unaware File System)** while maintaining **Strict SELinux Enforcement**.
+Custom **Android GKI 2.0 (`5.15`)** kernel for the **Realme Note 50** (`RMX3834` / Unisoc T612), built automatically with GitHub Actions.
 
----
-
-## 📱 Device & Architecture Specifications
-
-Even though Realme does not publish device-specific kernel sources for the Realme Note 50, Android's **GKI 2.0 (Generic Kernel Image)** architecture isolates the core Linux kernel from vendor-specific drivers:
-
-- **Device**: Realme Note 50 (`RMX3834`, `ums9230_1h10`)
-- **Chipset**: Unisoc Tiger T612 (UMS9230)
-- **Architecture**: `arm64` (aarch64), 4KB page size
-- **Kernel Family**: Android 13 Linux LTS `5.15` (Stock snapshot: `5.15.178-android13-8-g0ff3dab2ed1b-ab36`)
-- **GKI Version**: GKI 2.0 (Boot image header version 4)
-- **Boot Partition Role**: The `boot` partition contains solely the generic Linux kernel `Image` (0 ramdisk). First-stage init ramdisk resides in `init_boot`, and vendor hardware drivers/modules reside in `vendor_boot`.
-
-Because the `boot` partition contains pure upstream GKI code, we compile directly from the official **Google Android Common Kernel (ACK)** repository and flash the resulting kernel cleanly without breaking vendor hardware drivers, cameras, cellular baseband, or display!
+Includes **SukiSU-Ultra (Spoofed Build)** for root access and **SUSFS** for hiding root, mounts, and bootloader unlock status.
 
 ---
 
-## 🛡️ Features & Stealth Capabilities
+## 📦 What's in Every Release
 
-### 1. SukiSU-Ultra (Spoofed Variant)
-- **Randomized Package Identity**: Works with SukiSU-Ultra's spoofed manager build. The APK uses randomized package, activity, and service identifiers to evade package name-based root detection.
-- **Dynamic Signature Fallback**: The kernel validates the APK's cryptographic v2 signature directly via `ksu_sig_fallback_run`, granting root access regardless of the randomized package name.
-- **Full SUSFS Integration**: Native SUSFS controls built into the SukiSU-Ultra manager and `ksud` daemon.
+Each release on the **Releases** page ships with:
 
-### 2. Properly Enforced SELinux
-- **Strictly Enforcing**: SELinux is compiled with `CONFIG_SECURITY_SELINUX=y` and `CONFIG_DEFAULT_SECURITY_SELINUX=y`. The kernel does **not** run in permissive mode (`permissive=0`, `enforcing=1`).
-- **SELinux Status Spoofing**: SUSFS hooks `/sys/fs/selinux/status` so that non-root applications (UID ≥ 10000) always see `enforcing=1` with untouched security context attributes.
-- **AVC Denial Spoofing**: Suppresses and spoofs audit vector log entries in `security/selinux/avc.c` so apps inspecting `dmesg` or logcat do not detect root activity.
-
-### 3. SUSFS (Stack-Unaware File System)
-- **Path & Mount Concealment**: Hides root overlay mounts, bind mounts, and root binaries from `/proc/mounts`, `/proc/[pid]/mountinfo`, and filesystem scans.
-- **Symbol Cloaking**: Removes and masks KernelSU and SUSFS identifiers from `/proc/kallsyms`.
-- **Command-line Concealment**: Spoofs `/proc/cmdline` and `/proc/bootconfig` to prevent bootloader unlock detection.
-- **Open Redirection & Map Hiding**: Safely redirects file operations away from protected locations and hides mmapped files.
-
-### 4. Stock Config Spoofing (`/proc/config.gz`)
-- Embeds the genuine stock Realme Note 50 defconfig extracted from the device's firmware snapshot into the kernel binary (`config/stock_defconfig`).
-- Banking apps and integrity checkers that decompress `/proc/config.gz` see the clean, unmodified stock Google GKI configuration without root or custom kernel flags.
-
-### 5. Clean Build Banner
-- Strips the `-dirty` suffix from `setlocalversion`.
-- Spoofs compile host, user (`build-user@build-host`), and build timestamp (`#1 SMP PREEMPT Thu Mar 12 04:26:13 UTC 2026`) in `scripts/mkcompile_h` to match Realme Note 50 stock release banners.
-
-### 6. Doze Mode & Suspend Stability Fix (Unisoc Tiger T612 / UMS9230)
-- **Spreadtrum / Unisoc Platform Support**: Enables `CONFIG_ARCH_SPRD=y` to match the Realme Note 50 stock kernel configuration.
-- **Hierarchical PSCI CPU Idle Domains**: Enables `CONFIG_ARM_PSCI_CPUIDLE_DOMAIN=y`, `CONFIG_DT_IDLE_STATES=y`, `CONFIG_CPU_IDLE_MULTIPLE_DRIVERS=y`, and `CONFIG_PM_GENERIC_DOMAINS_SLEEP=y`. Properly coordinates power collapse across the asymmetric big.LITTLE clusters (2x A75 + 6x A55) via PSCI firmware, preventing SoC sleep desynchronization.
-- **Watchdog-Safe Suspend**: Sets `CONFIG_SUSPEND_SKIP_SYNC=y` to prevent lengthy storage filesystem syncs during sleep entry from tripping the Unisoc hardware PMIC watchdog timer.
-- **Custom ROM & GSI SELinux Domain Compatibility**: Injects permissive `magisk` and `su` domains into the active kernel policy (`rules.c`) to ensure GSI init property actions (such as `sys.oem_unlock_allowed` toggles during idle maintenance) execute cleanly without `cannot setexeccon` fatal aborts.
+1. **`boot-enforcing.img`** — Kernel in **SELinux Enforcing** mode *(Recommended for stock ROM & most GSIs)*.
+2. **`boot-permissive.img`** — Kernel in **SELinux Permissive** mode *(Use if your custom GSI has broken SELinux policies; still reports `Enforcing` to regular user apps)*.
+3. **`SukiSU_*_spoofed.apk`** — Root Manager app *(uses a randomized package name so other apps cannot scan for it)*.
+4. **`susfs4ksu-module.zip`** — SUSFS companion module *(flash inside the SukiSU Manager app)*.
+5. **`ksu_susfs_tools.zip`** — Standalone `ksu_susfs` command-line tools.
 
 ---
 
-## 🚀 How to Build via GitHub Actions
-
-1. In this repository on GitHub, navigate to the **Actions** tab.
-2. Select **Build Realme Note 50 GKI 2.0 (SUSFS + SELinux Enforcing)** from the workflow list on the left.
-3. Click **Run workflow**:
-   - **Android Common Kernel Tag or Branch**: `android13-5.15.178_r00` (or `android13-5.15`)
-   - **Android Version**: `android13`
-   - **Kernel Version**: `5.15`
-   - **Root Provider**: `SukiSU-Ultra` (or `KernelSU`, `KernelSU-Next`)
-   - **Enable SUSFS**: `true`
-   - **Spoof /proc/config.gz**: `true`
-   - **Create GitHub Release**: `true`
-4. Click the green **Run workflow** button.
-5. The build runs on GitHub Actions runners (saving local CPU & RAM resources). Once finished:
-   - Check the **Releases** page or the **Artifacts** section of the run.
-   - Download the generated `boot.img`, raw `Image`, `susfs4ksu-module.zip`, and matching **Spoofed Manager APK**.
-
----
-
-## ⚡ Flashing Instructions (Fastbootd)
+## ⚡ How to Flash
 
 > [!IMPORTANT]
-> **Use fastbootd (`adb reboot fastboot`) — NOT bootloader fastboot (`reboot bootloader`)**:
-> The Realme Note 50 (Unisoc T612) dynamic partition scheme requires userspace fastboot (`fastbootd`) to flash GKI kernel boot images properly.
-> 
-> **AVB (Android Verified Boot)**:
-> The exploit used to unlock the Realme Note 50 bootloader already bypasses and handles AVB automatically. You do **not** need to flash `vbmeta` or use `--disable-verity` flags.
+> - Always use **`adb reboot fastboot`** to enter **`fastbootd`**. Do **NOT** use `adb reboot bootloader`.
+> - The Realme Note 50 unlock exploit already handles AVB. You do **not** need to flash `vbmeta` or disable verity.
 
-1. Connect the phone to your PC via USB with USB debugging enabled.
-2. Reboot into **fastbootd** (userspace fastboot):
+1. Reboot your phone into **fastbootd**:
    ```bash
    adb reboot fastboot
    ```
-3. Once the screen shows the fastbootd menu, verify communication:
+2. Flash **either** the Enforcing **or** Permissive boot image:
    ```bash
-   fastboot devices
+   # Recommended (SELinux Enforcing):
+   fastboot flash boot boot-enforcing.img
+
+   # Or if your GSI needs SELinux Permissive:
+   fastboot flash boot boot-permissive.img
    ```
-4. Flash the custom `boot.img` directly to the boot partition:
-   ```bash
-   # Flash directly to boot partition
-   fastboot flash boot boot.img
-   
-   # Or flash slot explicitly if needed:
-   fastboot flash boot_a boot.img
-   fastboot flash boot_b boot.img
-   ```
-5. Reboot your device:
+3. Reboot back to Android:
    ```bash
    fastboot reboot
    ```
 
 ---
 
-## 🔧 Post-Installation Setup
+## 🔧 Setup After Flashing
 
-1. **Install Spoofed Manager**:
-   - Install the spoofed manager APK bundled in the release (`SukiSU_v4.2.1-r2_41068-release-spoofed.apk`).
-   - The app installs with a randomized package name to defeat detection. The kernel recognizes and crowns it automatically.
-2. **Install SUSFS Companion Module**:
-   - Open SukiSU Manager.
-   - Go to **Modules** -> **Install from file**.
-   - Select `susfs4ksu-module.zip` (included in your build release artifacts).
-   - Reboot your phone.
-3. **Verify SUSFS Status**:
-   In Termux or an `adb shell` with root (`su`):
-   ```bash
-   ksu_susfs show version
-   ksu_susfs show enabled_features
-   ```
-   You should see the active SUSFS kernel version and enabled stealth features!
-4. **Verify SELinux Status**:
-   ```bash
-   getenforce
-   ```
-   It will output:
-   ```
-   Enforcing
-   ```
+1. Install **`SukiSU_*_spoofed.apk`** from the release.
+2. Open the SukiSU app -> **Modules** -> **Install from file** -> select **`susfs4ksu-module.zip`**.
+3. Reboot your phone.
 
 ---
 
-## 📂 Repository Layout
+## ✨ Key Features
 
-```
-.
-├── .github/
-│   └── workflows/
-│       └── build-kernel.yml      # Automated GitHub Actions GKI build workflow
-├── config/
-│   └── stock_defconfig           # Extracted genuine Realme Note 50 stock config
-├── tools/
-│   └── mkbootimg/                # Android boot image header v4 tools
-├── BUGFIX_LOG.md                 # Static audit & bugfix history log
-└── README.md                     # Documentation and flashing guide
-```
+- **Root & Mount Hiding (SUSFS)**: Filters root mounts from `/proc/self/mountinfo` without breaking `/proc` file access, hides KernelSU/SUSFS symbols from `/proc/kallsyms`, and spoofs `/proc/cmdline` & `/proc/bootconfig` to report `locked` / `green`.
+- **Stock Config Spoofing**: `/proc/config.gz` reports the untouched stock Realme Note 50 config (`config/stock_defconfig`).
+- **Clean Kernel Banner**: Matches the stock Realme Note 50 kernel version suffix (`-android13-8-g0ff3dab2ed1b-ab36`) and removes `-dirty` flags so all stock vendor modules (`vendor_boot`) load cleanly.
+- **Doze & Deep Sleep Fix**: Includes Unisoc T612 (`CONFIG_ARCH_SPRD`) PSCI CPU idle domain configs so the phone does not reboot when entering deep sleep / Doze mode.
 
 ---
 
-## ⚠️ Recovery / Fallback
+## ⚠️ Known Issues
 
-If you encounter any boot issue or want to revert to stock:
-- Flash your stock `boot_a.img` from the backup archive:
-  ```bash
-  fastboot flash boot_a boot_a.img
-  fastboot reboot
-  ```
+1. **Momo 4.4.1 Crashes on Android 15 / 16 GSIs**:
+   - **Fixed**: Momo's *"The environment is broken: Damaging behavior is detected"* error (caused by SukiSU's default `mount_hide` returning `-ENOENT` on `/proc/self/mountinfo`) is **fixed** in this kernel by letting SUSFS filter `mountinfo` cleanly.
+   - **Android 15/16 Momo Bug**: On Android 15 and Android 16 ROMs, Momo 4.4.1 (released in 2022) crashes right after starting because Google renamed `solist` to `solist_head` inside `/apex/com.android.runtime/bin/linker64`, causing a null-pointer crash inside Momo's own `libmahoshojo.so`.
+2. **Custom GSI Fix Modules (`realme_note_50_gsi_fixes`)**:
+   - If you use a GSI fix module that mounts an overlay on `/system/product/overlay` or creates world-readable folders in `/dev` (such as `/dev/imsfix`), apps that use `AppZygote` can fail to start when **"Umount modules"** is turned on for them, because Zygote tries to reopen the unmounted overlay APK.
+3. **Spoofing an Android 15 Fingerprint on an Android 16 GSI**:
+   - If you run an Android 16 GSI (`ro.build.version.sdk=36`) with a Play Integrity Fix module that spoofs Realme Note 50's stock Android 15 fingerprint (`ro.build.version.release=15`), strict root detectors will flag the mismatch between Android 15 and SDK 36.
 
 ---
 
-## 📜 Credits & Acknowledgments
-- **Google Android Open Source Project (AOSP)**: Android Common Kernel (ACK) & GKI 2.0
-- **SukiSU-Ultra**: [SukiSU-Ultra/SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra)
-- **KernelSU**: [tiann/KernelSU](https://github.com/tiann/KernelSU) & [KernelSU-Next](https://github.com/KernelSU-Next/KernelSU-Next)
-- **SUSFS**: [simonpunk/susfs4ksu](https://gitlab.com/simonpunk/susfs4ksu)
+## 🛠️ How to Trigger a New Build on GitHub
+
+1. Open the **Actions** tab on GitHub.
+2. Select **Build Realme Note 50 GKI 2.0 (SUSFS + Enforcing & Permissive)**.
+3. Click **Run workflow** -> **Run workflow**.
+
+---
+
+## 📜 Credits
+
+- [Google Android Common Kernel (ACK)](https://android.googlesource.com/kernel/common)
+- [SukiSU-Ultra](https://github.com/SukiSU-Ultra/SukiSU-Ultra)
+- [SUSFS (`susfs4ksu`)](https://gitlab.com/simonpunk/susfs4ksu)
