@@ -4,7 +4,43 @@ This document tracks bugs discovered and resolved in the `real-erm/realme-note50
 
 ---
 
-## 2026-10-28 — Static Audit & Pipeline Fixes
+## 2026-10-28 — Second Static Audit: Critical & Root-Hiding Fixes
+
+### 1. Sanitized `/sys/kernel/kheaders.tar.xz` (`CONFIG_IKHEADERS=y`) Header & `autoconf.h` Leaks (Critical — Root Hiding)
+- **Symptom**: Even when `/proc/config.gz` was spoofed with `config/stock_defconfig`, `/sys/kernel/kheaders.tar.xz` embedded `include/linux/susfs.h`, `include/linux/susfs_def.h`, `include/config/ksu/*`, and `include/generated/autoconf.h` containing `#define CONFIG_KSU 1` and `#define CONFIG_KSU_SUSFS 1`.
+- **Root Cause**: `kernel/gen_kheaders.sh` packs all `*.h` files from both `$(srctree)/include/` and `$(objtree)/include/` into `kernel/kheaders_data.tar.xz` without filtering out SUSFS or KSU headers and Kconfig symbols.
+- **Fix**: Patched `kernel/gen_kheaders.sh` to remove `susfs.h`, `susfs_def.h`, and `include/config/ksu*` from the temporary `$cpio_dir` staging directory and strip `CONFIG_KSU*` lines from the staged `include/generated/autoconf.h` before creating `kheaders_data.tar.xz`.
+
+### 2. Activated Runtime SUSFS Protections & Fixed Read-Only Path Bug in `susfs4ksu-module.zip` (Critical — Root Hiding & Functionality)
+- **Symptom**: Flashing `susfs4ksu-module.zip` installed `/data/adb/ksu/bin/ksu_susfs` but activated zero runtime SUSFS protections.
+- **Root Cause**:
+  1. Upstream `simonpunk/susfs4ksu` wraps all commands in `post-fs-data.sh`, `service.sh`, and `boot-completed.sh` inside `cat <<EOF >/dev/null ... EOF` blocks or `#` comments as inert examples.
+  2. Line 70 of upstream `post-fs-data.sh` wrote `cat /proc/bootconfig > ./fake_bootconfig.txt` (targeting read-only `/` during `post-fs-data`) instead of `${FAKE_BOOTCONFIG}`.
+  3. `customize.sh` omitted `boot-completed.sh` from its `chmod 644` call.
+- **Fix**: Configured `post-fs-data.sh`, `service.sh`, `boot-completed.sh`, and `customize.sh` during module packaging to automatically enable SELinux AVC log spoofing (`enable_avc_log_spoofing 1`), `/proc/bootconfig` spoofing (`green` / `locked` / `reboot`), stock `uname` timestamp spoofing, kernel log disabling (`enable_log 0`), `resetprop` verified-boot property sanitization, and `add_sus_path` / `add_sus_path_loop` hiding for recovery/loop paths.
+
+### 3. Removed Unconditional `"magisk"` and `"su"` SELinux Domain Injection (Critical — Root Hiding)
+- **Symptom**: Root detectors inspecting `/sys/fs/selinux/policy` (`pol_read_bin`) or querying security context SIDs could detect `DirtySepolicy` due to the presence of permissive `"magisk"` and `"su"` domains.
+- **Root Cause**: `.github/workflows/build-kernel.yml` unconditionally injected `ksu_type(db, "magisk", "domain")` and `ksu_type(db, "su", "domain")` into `selinux/rules.c`. `selinux_hide.c` does not hook `/sys/fs/selinux/policy` binary policy reads, and injecting `"su"` is also redundant when `KERNEL_SU_DOMAIN` is already `"su"`.
+- **Fix**: Removed the unconditional `"magisk"` and `"su"` domain injection from `selinux/rules.c` so compiled kernels maintain a clean SELinux policy.
+
+### 4. Added Kernel-Level `/proc/cmdline` Bootloader & Verified Boot State Spoofing (`fs/proc/cmdline.c`) (High — Root Hiding)
+- **Symptom**: Apps reading `/proc/cmdline` directly could still observe `androidboot.verifiedbootstate=orange`, `androidboot.vbmeta.device_state=unlocked`, or `androidboot.flash.locked=0`.
+- **Root Cause**: On `gki-android13-5.15`, `50_add_susfs_in_gki-android13-5.15.patch` only hooks `fs/proc/bootconfig.c` (`boot_config_proc_show`) and leaves `fs/proc/cmdline.c` unpatched. On Unisoc Tiger T612 (`UMS9230`), U-Boot passes `androidboot.*` arguments via `/chosen/bootargs` into `/proc/cmdline` (`CONFIG_CMDLINE_EXTEND=y`).
+- **Fix**: Patched `fs/proc/cmdline.c` (`proc_cmdline_init`) to initialize a sanitized `spoofed_command_line` buffer at `fs_initcall` that rewrites `verifiedbootstate=orange/yellow` $\rightarrow$ `green`, `vbmeta.device_state=unlocked` $\rightarrow$ `locked`, `flash.locked=0` $\rightarrow$ `1`, and `veritymode=disabled` $\rightarrow$ `enforcing` for all `/proc/cmdline` readers without altering internal `saved_command_line`.
+
+### 5. Defaulted `susfs_is_log_enabled` to `false` at Boot in `fs/susfs.c` (High — Root Hiding)
+- **Symptom**: SUSFS emitted `susfs:` operational logs to the kernel ring buffer (`dmesg`) during early boot before userspace scripts ran, and printed `"susfs: disable logging to kernel"` when `enable_log 0` was invoked.
+- **Root Cause**: `fs/susfs.c` declared `DEFINE_STATIC_KEY_TRUE(susfs_is_log_enabled)` and called `pr_info("susfs: disable logging to kernel")` inside `susfs_enable_log()`.
+- **Fix**: Patched `common/fs/susfs.c` to use `DEFINE_STATIC_KEY_FALSE(susfs_is_log_enabled)` and removed the `pr_info("susfs: disable logging to kernel")` call so SUSFS logging is completely silent from boot unless explicitly enabled for debugging.
+
+### 6. Pinned `VERSION=1` in `scripts/mkcompile_h` (Low — Root Hiding)
+- **Symptom**: Multiple link passes during `build/build.sh` could increment `.version` and produce `#2 SMP PREEMPT ...` in `UTS_VERSION`.
+- **Fix**: Explicitly pinned `VERSION=1` alongside `TIMESTAMP`, `LINUX_COMPILE_BY`, and `LINUX_COMPILE_HOST` in `scripts/mkcompile_h`.
+
+---
+
+## 2026-10-28 — First Static Audit & Pipeline Fixes
 
 ### 1. Fixed Broken `susfs4ksu-module.zip` Packaging (High)
 - **Symptom**: Flashing `susfs4ksu-module.zip` in SukiSU / KernelSU Manager failed to install `/data/adb/ksu/bin/ksu_susfs`.
